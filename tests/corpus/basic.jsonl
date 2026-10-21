@@ -1,0 +1,19 @@
+{"format":1,"type":"xmlDecl","version":"1.0","encoding":"UTF-8","standalone":null}
+{"format":1,"type":"comment","data":" shipped example "}
+{"format":1,"type":"start","name":"doc","attributes":{"a":"first","z":"last"}}
+{"format":1,"type":"text","data":"\n  "}
+{"format":1,"type":"start","name":"child","attributes":{"id":"1"}}
+{"format":1,"type":"text","data":"text & more"}
+{"format":1,"type":"end","name":"child"}
+{"format":1,"type":"text","data":"\n  "}
+{"format":1,"type":"start","name":"empty","attributes":{}}
+{"format":1,"type":"end","name":"empty"}
+{"format":1,"type":"text","data":"\n  "}
+{"format":1,"type":"cdataStart"}
+{"format":1,"type":"text","data":"raw <text>"}
+{"format":1,"type":"cdataEnd"}
+{"format":1,"type":"text","data":"\n  "}
+{"format":1,"type":"pi","target":"note","data":"keep"}
+{"format":1,"type":"text","data":"\n"}
+{"format":1,"type":"end","name":"doc"}
+{"format":1,"type":"result","ok":true}

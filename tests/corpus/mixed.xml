@@ -1,0 +1,4 @@
+<?xml version="1.0"?>
+<!--p--><?pi d?>
+<root a="1">x<![CDATA[y]]><!--c--><?q ?></root>
+<!--e--><?r?>

@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- shipped example -->
+<doc z="last" a="first">
+  <child id="1">text &amp; more</child>
+  <empty/>
+  <![CDATA[raw <text>]]>
+  <?note keep?>
+</doc>

@@ -1,0 +1,14 @@
+.lake/
+lake-packages/
+*.olean
+Vendor/expat/
+
+# editor lock and autosave files
+\#*#
+.#*
+
+.direnv
+
+# Python bytecode from the test harness
+__pycache__/
+*.pyc

@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+  workflow_dispatch:
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Nix and flakes must exist before any `nix develop` command.
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: "experimental-features = nix-command flakes"
+
+      - name: build the library and proofs
+        run: nix develop -c lake build
+
+      - name: build the trace executable
+        run: nix develop -c lake build lexpatTrace
+
+      - name: differential against libexpat
+        run: nix develop -c python3 tests/differential.py
+
+      - name: resource-budget cases
+        run: nix develop -c python3 tests/differential.py --group limits
+
+      - name: no admitted or unsafe definitions
+        run: nix develop -c bash tests/no-admits.sh
+
+      - name: decoder proof audit
+        run: nix develop -c lake env lean LexPat/Encoding/Proofs.lean

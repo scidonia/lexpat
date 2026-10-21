@@ -1,0 +1,2286 @@
+{
+ "format": 1,
+ "cases": [
+  {
+   "id": "enc-utf8-text",
+   "group": "encoding-valid",
+   "hex": "3c613ee282ac3c2f613e",
+   "expected": {
+    "ok": true,
+    "events": [
+     {
+      "format": 1,
+      "type": "start",
+      "name": "a",
+      "attributes": {}
+     },
+     {
+      "format": 1,
+      "type": "text",
+      "data": "€"
+     },
+     {
+      "format": 1,
+      "type": "end",
+      "name": "a"
+     }
+    ]
+   }
+  },
+  {
+   "id": "enc-utf8-bom",
+   "group": "encoding-valid",
+   "hex": "efbbbf3c612f3e",
+   "expected": {
+    "ok": true,
+    "events": [
+     {
+      "format": 1,
+      "type": "start",
+      "name": "a",
+      "attributes": {}
+     },
+     {
+      "format": 1,
+      "type": "end",
+      "name": "a"
+     }
+    ]
+   }
+  },
+  {
+   "id": "enc-utf16le-bom",
+   "group": "encoding-valid",
+   "hex": "fffe3c0061002f003e00",
+   "expected": {
+    "ok": true,
+    "events": [
+     {
+      "format": 1,
+      "type": "start",
+      "name": "a",
+      "attributes": {}
+     },
+     {
+      "format": 1,
+      "type": "end",
+      "name": "a"
+     }
+    ]
+   }
+  },
+  {
+   "id": "enc-utf16be-bom",
+   "group": "encoding-valid",
+   "hex": "feff003c0061002f003e",
+   "expected": {
+    "ok": true,
+    "events": [
+     {
+      "format": 1,
+      "type": "start",
+      "name": "a",
+      "attributes": {}
+     },
+     {
+      "format": 1,
+      "type": "end",
+      "name": "a"
+     }
+    ]
+   }
+  },
+  {
+   "id": "enc-utf16le-signature",
+   "group": "encoding-valid",
+   "hex": "3c0061002f003e00",
+   "expected": {
+    "ok": true,
+    "events": [
+     {
+      "format": 1,
+      "type": "start",
+      "name": "a",
+      "attributes": {}
+     },
+     {
+      "format": 1,
+      "type": "end",
+      "name": "a"
+     }
+    ]
+   }
+  },
+  {
+   "id": "enc-utf16be-signature",
+   "group": "encoding-valid",
+   "hex": "003c0061002f003e",
+   "expected": {
+    "ok": true,
+    "events": [
+     {
+      "format": 1,
+      "type": "start",
+      "name": "a",
+      "attributes": {}
+     },
+     {
+      "format": 1,
+      "type": "end",
+      "name": "a"
+     }
+    ]
+   }
+  },
+  {
+   "id": "enc-latin1-decl",
+   "group": "encoding-valid",
+   "file": "tests/corpus/latin1.xml",
+   "expected": {
+    "ok": true,
+    "events": [
+     {
+      "format": 1,
+      "type": "xmlDecl",
+      "version": "1.0",
+      "encoding": "ISO-8859-1",
+      "standalone": null
+     },
+     {
+      "format": 1,
+      "type": "start",
+      "name": "a",
+      "attributes": {}
+     },
+     {
+      "format": 1,
+      "type": "text",
+      "data": "é"
+     },
+     {
+      "format": 1,
+      "type": "end",
+      "name": "a"
+     }
+    ]
+   }
+  },
+  {
+   "id": "enc-ascii-decl",
+   "group": "encoding-valid",
+   "file": "tests/corpus/ascii.xml",
+   "expected": {
+    "ok": true,
+    "events": [
+     {
+      "format": 1,
+      "type": "xmlDecl",
+      "version": "1.0",
+      "encoding": "US-ASCII",
+      "standalone": null
+     },
+     {
+      "format": 1,
+      "type": "start",
+      "name": "a",
+      "attributes": {}
+     },
+     {
+      "format": 1,
+      "type": "text",
+      "data": "x"
+     },
+     {
+      "format": 1,
+      "type": "end",
+      "name": "a"
+     }
+    ]
+   }
+  },
+  {
+   "id": "enc-utf8-bom-decl",
+   "group": "encoding-valid",
+   "hex": "efbbbf3c3f786d6c2076657273696f6e3d22312e302220656e636f64696e673d225554462d38223f3e3c612f3e",
+   "expected": {
+    "ok": true,
+    "events": [
+     {
+      "format": 1,
+      "type": "xmlDecl",
+      "version": "1.0",
+      "encoding": "UTF-8",
+      "standalone": null
+     },
+     {
+      "format": 1,
+      "type": "start",
+      "name": "a",
+      "attributes": {}
+     },
+     {
+      "format": 1,
+      "type": "end",
+      "name": "a"
+     }
+    ]
+   }
+  },
+  {
+   "id": "enc-utf16le-decl-utf16",
+   "group": "encoding-valid",
+   "hex": "fffe3c003f0078006d006c002000760065007200730069006f006e003d00220031002e0030002200200065006e0063006f00640069006e0067003d0022005500540046002d003100360022003f003e003c0061002f003e00",
+   "expected": {
+    "ok": true,
+    "events": [
+     {
+      "format": 1,
+      "type": "xmlDecl",
+      "version": "1.0",
+      "encoding": "UTF-16",
+      "standalone": null
+     },
+     {
+      "format": 1,
+      "type": "start",
+      "name": "a",
+      "attributes": {}
+     },
+     {
+      "format": 1,
+      "type": "end",
+      "name": "a"
+     }
+    ]
+   }
+  },
+  {
+   "id": "enc-utf16le-decl-le",
+   "group": "encoding-valid",
+   "hex": "fffe3c003f0078006d006c002000760065007200730069006f006e003d00220031002e0030002200200065006e0063006f00640069006e0067003d0022005500540046002d00310036004c00450022003f003e003c0061002f003e00",
+   "expected": {
+    "ok": true,
+    "events": [
+     {
+      "format": 1,
+      "type": "xmlDecl",
+      "version": "1.0",
+      "encoding": "UTF-16LE",
+      "standalone": null
+     },
+     {
+      "format": 1,
+      "type": "start",
+      "name": "a",
+      "attributes": {}
+     },
+     {
+      "format": 1,
+      "type": "end",
+      "name": "a"
+     }
+    ]
+   }
+  },
+  {
+   "id": "enc-utf16be-decl-be",
+   "group": "encoding-valid",
+   "hex": "feff003c003f0078006d006c002000760065007200730069006f006e003d00220031002e0030002200200065006e0063006f00640069006e0067003d0022005500540046002d00310036004200450022003f003e003c0061002f003e",
+   "expected": {
+    "ok": true,
+    "events": [
+     {
+      "format": 1,
+      "type": "xmlDecl",
+      "version": "1.0",
+      "encoding": "UTF-16BE",
+      "standalone": null
+     },
+     {
+      "format": 1,
+      "type": "start",
+      "name": "a",
+      "attributes": {}
+     },
+     {
+      "format": 1,
+      "type": "end",
+      "name": "a"
+     }
+    ]
+   }
+  },
+  {
+   "id": "enc-utf16-surrogate-pair",
+   "group": "encoding-valid",
+   "hex": "fffe3c0061003e003dd800de3c002f0061003e00",
+   "expected": {
+    "ok": true,
+    "events": [
+     {
+      "format": 1,
+      "type": "start",
+      "name": "a",
+      "attributes": {}
+     },
+     {
+      "format": 1,
+      "type": "text",
+      "data": "😀"
+     },
+     {
+      "format": 1,
+      "type": "end",
+      "name": "a"
+     }
+    ]
+   }
+  },
+  {
+   "id": "att-overlong-c0",
+   "group": "encoding-attack",
+   "hex": "3c613ec0803c2f613e",
+   "expected": {
+    "ok": false,
+    "code": "INVALID_TOKEN",
+    "reason": "overlong"
+   }
+  },
+  {
+   "id": "att-overlong-c1",
+   "group": "encoding-attack",
+   "hex": "3c613ec1bf3c2f613e",
+   "expected": {
+    "ok": false,
+    "code": "INVALID_TOKEN",
+    "reason": "overlong"
+   }
+  },
+  {
+   "id": "att-overlong-3byte",
+   "group": "encoding-attack",
+   "hex": "3c613ee080803c2f613e",
+   "expected": {
+    "ok": false,
+    "code": "INVALID_TOKEN",
+    "reason": "overlong"
+   }
+  },
+  {
+   "id": "att-overlong-4byte",
+   "group": "encoding-attack",
+   "hex": "3c613ef08080803c2f613e",
+   "expected": {
+    "ok": false,
+    "code": "INVALID_TOKEN",
+    "reason": "overlong"
+   }
+  },
+  {
+   "id": "att-utf8-surrogate",
+   "group": "encoding-attack",
+   "hex": "3c613eeda0803c2f613e",
+   "expected": {
+    "ok": false,
+    "code": "INVALID_TOKEN",
+    "reason": "surrogate"
+   }
+  },
+  {
+   "id": "att-utf8-out-of-range",
+   "group": "encoding-attack",
+   "hex": "3c613ef49080803c2f613e",
+   "expected": {
+    "ok": false,
+    "code": "INVALID_TOKEN",
+    "reason": "outOfRange"
+   }
+  },
+  {
+   "id": "att-utf8-bad-continuation",
+   "group": "encoding-attack",
+   "hex": "3c613ee228a13c2f613e",
+   "expected": {
+    "ok": false,
+    "code": "INVALID_TOKEN",
+    "reason": "invalidContinuation"
+   }
+  },
+  {
+   "id": "att-utf8-bad-lead",
+   "group": "encoding-attack",
+   "hex": "803c612f3e",
+   "expected": {
+    "ok": false,
+    "code": "INVALID_TOKEN",
+    "reason": "invalidLead"
+   }
+  },
+  {
+   "id": "att-utf8-truncated-eof",
+   "group": "encoding-attack",
+   "hex": "3c613ee282",
+   "expected": {
+    "ok": false,
+    "code": "PARTIAL_CHAR",
+    "reason": "truncated"
+   }
+  },
+  {
+   "id": "att-utf16-odd-length",
+   "group": "encoding-attack",
+   "hex": "fffe3c0061002f003e0041",
+   "reference": {
+    "ok": false,
+    "code": "UNCLOSED_TOKEN"
+   },
+   "exception": "an odd trailing UTF-16 byte is rejected locally as oddUtf16Length; Expat reports UNCLOSED_TOKEN for the same bytes",
+   "expected": {
+    "ok": false,
+    "code": "PARTIAL_CHAR",
+    "reason": "oddUtf16Length"
+   }
+  },
+  {
+   "id": "att-utf16-unpaired-high",
+   "group": "encoding-attack",
+   "hex": "fffe3c0061003e0000d83c002f0061003e00",
+   "expected": {
+    "ok": false,
+    "code": "INVALID_TOKEN",
+    "reason": "unpairedSurrogate"
+   }
+  },
+  {
+   "id": "att-utf16-lone-low",
+   "group": "encoding-attack",
+   "hex": "fffe3c0061003e0000dc3c002f0061003e00",
+   "expected": {
+    "ok": false,
+    "code": "INVALID_TOKEN",
+    "reason": "unpairedSurrogate"
+   }
+  },
+  {
+   "id": "att-ascii-high-byte",
+   "group": "encoding-attack",
+   "hex": "3c3f786d6c2076657273696f6e3d22312e302220656e636f64696e673d2255532d4153434949223f3e3c613ee93c2f613e",
+   "expected": {
+    "ok": false,
+    "code": "INVALID_TOKEN",
+    "reason": "invalidAscii"
+   }
+  },
+  {
+   "id": "att-bom-vs-latin1-decl",
+   "group": "encoding-attack",
+   "hex": "efbbbf3c3f786d6c2076657273696f6e3d22312e302220656e636f64696e673d2249534f2d383835392d31223f3e3c612f3e",
+   "reference": {
+    "ok": true,
+    "events": [
+     {
+      "format": 1,
+      "type": "xmlDecl",
+      "version": "1.0",
+      "encoding": "ISO-8859-1",
+      "standalone": null
+     },
+     {
+      "format": 1,
+      "type": "start",
+      "name": "a",
+      "attributes": {}
+     },
+     {
+      "format": 1,
+      "type": "end",
+      "name": "a"
+     }
+    ]
+   },
+   "exception": "a UTF-8 BOM contradicted by encoding=\"ISO-8859-1\" is rejected as INCORRECT_ENCODING; Expat accepts the declaration and decodes as UTF-8",
+   "expected": {
+    "ok": false,
+    "code": "INCORRECT_ENCODING",
+    "reason": "encodingMismatch"
+   }
+  },
+  {
+   "id": "att-utf16le-vs-be-decl",
+   "group": "encoding-attack",
+   "hex": "fffe3c003f0078006d006c002000760065007200730069006f006e003d00220031002e0030002200200065006e0063006f00640069006e0067003d0022005500540046002d00310036004200450022003f003e003c0061002f003e00",
+   "expected": {
+    "ok": false,
+    "code": "INCORRECT_ENCODING",
+    "reason": "encodingMismatch"
+   }
+  },
+  {
+   "id": "att-unknown-encoding",
+   "group": "encoding-attack",
+   "hex": "3c3f786d6c2076657273696f6e3d22312e302220656e636f64696e673d22782d756e6b6e6f776e223f3e3c612f3e",
+   "expected": {
+    "ok": false,
+    "code": "UNKNOWN_ENCODING",
+    "reason": "unknownEncoding"
+   }
+  },
+  {
+   "id": "att-utf16-decl-without-bom",
+   "group": "encoding-attack",
+   "hex": "3c3f786d6c2076657273696f6e3d22312e302220656e636f64696e673d225554462d3136223f3e3c612f3e",
+   "expected": {
+    "ok": false,
+    "code": "INCORRECT_ENCODING",
+    "reason": "encodingMismatch"
+   }
+  },
+  {
+   "id": "att-utf8-decl-invalid-byte",
+   "group": "encoding-attack",
+   "hex": "3c3f786d6c2076657273696f6e3d22312e302220656e636f64696e673d225554462d38223f3e3c613ee93c2f613e",
+   "expected": {
+    "ok": false,
+    "code": "INVALID_TOKEN",
+    "reason": "invalidContinuation"
+   }
+  },
+  {
+   "id": "xml-basic",
+   "group": "xml-valid",
+   "file": "tests/corpus/basic.xml",
+   "expected": {
+    "ok": true,
+    "events": [
+     {
+      "format": 1,
+      "type": "xmlDecl",
+      "version": "1.0",
+      "encoding": "UTF-8",
+      "standalone": null
+     },
+     {
+      "format": 1,
+      "type": "comment",
+      "data": " shipped example "
+     },
+     {
+      "format": 1,
+      "type": "start",
+      "name": "doc",
+      "attributes": {
+       "a": "first",
+       "z": "last"
+      }
+     },
+     {
+      "format": 1,
+      "type": "text",
+      "data": "\n  "
+     },
+     {
+      "format": 1,
+      "type": "start",
+      "name": "child",
+      "attributes": {
+       "id": "1"
+      }
+     },
+     {
+      "format": 1,
+      "type": "text",
+      "data": "text & more"
+     },
+     {
+      "format": 1,
+      "type": "end",
+      "name": "child"
+     },
+     {
+      "format": 1,
+      "type": "text",
+      "data": "\n  "
+     },
+     {
+      "format": 1,
+      "type": "start",
+      "name": "empty",
+      "attributes": {}
+     },
+     {
+      "format": 1,
+      "type": "end",
+      "name": "empty"
+     },
+     {
+      "format": 1,
+      "type": "text",
+      "data": "\n  "
+     },
+     {
+      "format": 1,
+      "type": "cdataStart"
+     },
+     {
+      "format": 1,
+      "type": "text",
+      "data": "raw <text>"
+     },
+     {
+      "format": 1,
+      "type": "cdataEnd"
+     },
+     {
+      "format": 1,
+      "type": "text",
+      "data": "\n  "
+     },
+     {
+      "format": 1,
+      "type": "pi",
+      "target": "note",
+      "data": "keep"
+     },
+     {
+      "format": 1,
+      "type": "text",
+      "data": "\n"
+     },
+     {
+      "format": 1,
+      "type": "end",
+      "name": "doc"
+     }
+    ]
+   }
+  },
+  {
+   "id": "xml-mixed",
+   "group": "xml-valid",
+   "file": "tests/corpus/mixed.xml",
+   "expected": {
+    "ok": true,
+    "events": [
+     {
+      "format": 1,
+      "type": "xmlDecl",
+      "version": "1.0",
+      "encoding": null,
+      "standalone": null
+     },
+     {
+      "format": 1,
+      "type": "comment",
+      "data": "p"
+     },
+     {
+      "format": 1,
+      "type": "pi",
+      "target": "pi",
+      "data": "d"
+     },
+     {
+      "format": 1,
+      "type": "start",
+      "name": "root",
+      "attributes": {
+       "a": "1"
+      }
+     },
+     {
+      "format": 1,
+      "type": "text",
+      "data": "x"
+     },
+     {
+      "format": 1,
+      "type": "cdataStart"
+     },
+     {
+      "format": 1,
+      "type": "text",
+      "data": "y"
+     },
+     {
+      "format": 1,
+      "type": "cdataEnd"
+     },
+     {
+      "format": 1,
+      "type": "comment",
+      "data": "c"
+     },
+     {
+      "format": 1,
+      "type": "pi",
+      "target": "q",
+      "data": ""
+     },
+     {
+      "format": 1,
+      "type": "end",
+      "name": "root"
+     },
+     {
+      "format": 1,
+      "type": "comment",
+      "data": "e"
+     },
+     {
+      "format": 1,
+      "type": "pi",
+      "target": "r",
+      "data": ""
+     }
+    ]
+   }
+  },
+  {
+   "id": "xml-empty-tags",
+   "group": "xml-valid",
+   "hex": "3c613e3c622f3e3c633e3c2f633e3c2f613e",
+   "expected": {
+    "ok": true,
+    "events": [
+     {
+      "format": 1,
+      "type": "start",
+      "name": "a",
+      "attributes": {}
+     },
+     {
+      "format": 1,
+      "type": "start",
+      "name": "b",
+      "attributes": {}
+     },
+     {
+      "format": 1,
+      "type": "end",
+      "name": "b"
+     },
+     {
+      "format": 1,
+      "type": "start",
+      "name": "c",
+      "attributes": {}
+     },
+     {
+      "format": 1,
+      "type": "end",
+      "name": "c"
+     },
+     {
+      "format": 1,
+      "type": "end",
+      "name": "a"
+     }
+    ]
+   }
+  },
+  {
+   "id": "xml-attr-normalization",
+   "group": "xml-valid",
+   "hex": "3c61207461623d22782623393b79222077733d227826237832303b7922206c69746572616c3d22780979222063726c663d22780d0a7922206e756d657269632d63723d2278262331333b79222f3e",
+   "expected": {
+    "ok": true,
+    "events": [
+     {
+      "format": 1,
+      "type": "start",
+      "name": "a",
+      "attributes": {
+       "crlf": "x y",
+       "literal": "x y",
+       "numeric-cr": "x\ry",
+       "tab": "x\ty",
+       "ws": "x y"
+      }
+     },
+     {
+      "format": 1,
+      "type": "end",
+      "name": "a"
+     }
+    ]
+   }
+  },
+  {
+   "id": "xml-attr-entities",
+   "group": "xml-valid",
+   "hex": "3c6120783d2226616d703b266c743b2667743b2671756f743b2661706f733b222f3e",
+   "expected": {
+    "ok": true,
+    "events": [
+     {
+      "format": 1,
+      "type": "start",
+      "name": "a",
+      "attributes": {
+       "x": "&<>\"'"
+      }
+     },
+     {
+      "format": 1,
+      "type": "end",
+      "name": "a"
+     }
+    ]
+   }
+  },
+  {
+   "id": "xml-refs",
+   "group": "xml-valid",
+   "hex": "3c613e26616d703b266c743b2667743b2661706f733b2671756f743b262336353b26237834313b3c2f613e",
+   "expected": {
+    "ok": true,
+    "events": [
+     {
+      "format": 1,
+      "type": "start",
+      "name": "a",
+      "attributes": {}
+     },
+     {
+      "format": 1,
+      "type": "text",
+      "data": "&<>'\"AA"
+     },
+     {
+      "format": 1,
+      "type": "end",
+      "name": "a"
+     }
+    ]
+   }
+  },
+  {
+   "id": "xml-cdata",
+   "group": "xml-valid",
+   "hex": "3c613e3c215b43444154415b785d5d3e3c215b43444154415b5d5d3e3c2f613e",
+   "expected": {
+    "ok": true,
+    "events": [
+     {
+      "format": 1,
+      "type": "start",
+      "name": "a",
+      "attributes": {}
+     },
+     {
+      "format": 1,
+      "type": "cdataStart"
+     },
+     {
+      "format": 1,
+      "type": "text",
+      "data": "x"
+     },
+     {
+      "format": 1,
+      "type": "cdataEnd"
+     },
+     {
+      "format": 1,
+      "type": "cdataStart"
+     },
+     {
+      "format": 1,
+      "type": "cdataEnd"
+     },
+     {
+      "format": 1,
+      "type": "end",
+      "name": "a"
+     }
+    ]
+   }
+  },
+  {
+   "id": "xml-comment-pi",
+   "group": "xml-valid",
+   "hex": "3c212d2d702d2d3e3c3f706920643f3e3c613e3c212d2d632d2d3e3c3f713f3e3c2f613e3c212d2d652d2d3e3c3f723f3e",
+   "expected": {
+    "ok": true,
+    "events": [
+     {
+      "format": 1,
+      "type": "comment",
+      "data": "p"
+     },
+     {
+      "format": 1,
+      "type": "pi",
+      "target": "pi",
+      "data": "d"
+     },
+     {
+      "format": 1,
+      "type": "start",
+      "name": "a",
+      "attributes": {}
+     },
+     {
+      "format": 1,
+      "type": "comment",
+      "data": "c"
+     },
+     {
+      "format": 1,
+      "type": "pi",
+      "target": "q",
+      "data": ""
+     },
+     {
+      "format": 1,
+      "type": "end",
+      "name": "a"
+     },
+     {
+      "format": 1,
+      "type": "comment",
+      "data": "e"
+     },
+     {
+      "format": 1,
+      "type": "pi",
+      "target": "r",
+      "data": ""
+     }
+    ]
+   }
+  },
+  {
+   "id": "xml-line-endings",
+   "group": "xml-valid",
+   "hex": "3c613e780d0a790d7a0a3c2f613e",
+   "expected": {
+    "ok": true,
+    "events": [
+     {
+      "format": 1,
+      "type": "start",
+      "name": "a",
+      "attributes": {}
+     },
+     {
+      "format": 1,
+      "type": "text",
+      "data": "x\ny\nz\n"
+     },
+     {
+      "format": 1,
+      "type": "end",
+      "name": "a"
+     }
+    ]
+   }
+  },
+  {
+   "id": "xml-cdata-line-endings",
+   "group": "xml-valid",
+   "hex": "3c613e3c215b43444154415b780d0a790d7a5d5d3e3c2f613e",
+   "expected": {
+    "ok": true,
+    "events": [
+     {
+      "format": 1,
+      "type": "start",
+      "name": "a",
+      "attributes": {}
+     },
+     {
+      "format": 1,
+      "type": "cdataStart"
+     },
+     {
+      "format": 1,
+      "type": "text",
+      "data": "x\ny\nz"
+     },
+     {
+      "format": 1,
+      "type": "cdataEnd"
+     },
+     {
+      "format": 1,
+      "type": "end",
+      "name": "a"
+     }
+    ]
+   }
+  },
+  {
+   "id": "xml-comment-line-endings",
+   "group": "xml-valid",
+   "hex": "3c613e3c212d2d780d0a790d7a2d2d3e3c2f613e",
+   "expected": {
+    "ok": true,
+    "events": [
+     {
+      "format": 1,
+      "type": "start",
+      "name": "a",
+      "attributes": {}
+     },
+     {
+      "format": 1,
+      "type": "comment",
+      "data": "x\ny\nz"
+     },
+     {
+      "format": 1,
+      "type": "end",
+      "name": "a"
+     }
+    ]
+   }
+  },
+  {
+   "id": "xml-pi-line-endings",
+   "group": "xml-valid",
+   "hex": "3c613e3c3f706920780d0a793f3e3c2f613e",
+   "expected": {
+    "ok": true,
+    "events": [
+     {
+      "format": 1,
+      "type": "start",
+      "name": "a",
+      "attributes": {}
+     },
+     {
+      "format": 1,
+      "type": "pi",
+      "target": "pi",
+      "data": "x\ny"
+     },
+     {
+      "format": 1,
+      "type": "end",
+      "name": "a"
+     }
+    ]
+   }
+  },
+  {
+   "id": "xml-unicode-text",
+   "group": "xml-valid",
+   "hex": "3c613ec3a9f09f98803c2f613e",
+   "expected": {
+    "ok": true,
+    "events": [
+     {
+      "format": 1,
+      "type": "start",
+      "name": "a",
+      "attributes": {}
+     },
+     {
+      "format": 1,
+      "type": "text",
+      "data": "é😀"
+     },
+     {
+      "format": 1,
+      "type": "end",
+      "name": "a"
+     }
+    ]
+   }
+  },
+  {
+   "id": "xml-unicode-names",
+   "group": "xml-valid",
+   "file": "tests/corpus/unicode-names.xml",
+   "expected": {
+    "ok": true,
+    "events": [
+     {
+      "format": 1,
+      "type": "start",
+      "name": "é",
+      "attributes": {
+       "a·": "1"
+      }
+     },
+     {
+      "format": 1,
+      "type": "text",
+      "data": "x"
+     },
+     {
+      "format": 1,
+      "type": "end",
+      "name": "é"
+     }
+    ]
+   }
+  },
+  {
+   "id": "xml-namespace-raw",
+   "group": "xml-valid",
+   "hex": "3c703a6120786d6c6e733a703d22752220703a623d2276222f3e",
+   "expected": {
+    "ok": true,
+    "events": [
+     {
+      "format": 1,
+      "type": "start",
+      "name": "p:a",
+      "attributes": {
+       "p:b": "v",
+       "xmlns:p": "u"
+      }
+     },
+     {
+      "format": 1,
+      "type": "end",
+      "name": "p:a"
+     }
+    ]
+   }
+  },
+  {
+   "id": "xml-standalone-yes",
+   "group": "xml-valid",
+   "hex": "3c3f786d6c2076657273696f6e3d22312e3022207374616e64616c6f6e653d22796573223f3e3c612f3e",
+   "expected": {
+    "ok": true,
+    "events": [
+     {
+      "format": 1,
+      "type": "xmlDecl",
+      "version": "1.0",
+      "encoding": null,
+      "standalone": true
+     },
+     {
+      "format": 1,
+      "type": "start",
+      "name": "a",
+      "attributes": {}
+     },
+     {
+      "format": 1,
+      "type": "end",
+      "name": "a"
+     }
+    ]
+   }
+  },
+  {
+   "id": "xml-standalone-no",
+   "group": "xml-valid",
+   "hex": "3c3f786d6c2076657273696f6e3d22312e3022207374616e64616c6f6e653d226e6f223f3e3c612f3e",
+   "expected": {
+    "ok": true,
+    "events": [
+     {
+      "format": 1,
+      "type": "xmlDecl",
+      "version": "1.0",
+      "encoding": null,
+      "standalone": false
+     },
+     {
+      "format": 1,
+      "type": "start",
+      "name": "a",
+      "attributes": {}
+     },
+     {
+      "format": 1,
+      "type": "end",
+      "name": "a"
+     }
+    ]
+   }
+  },
+  {
+   "id": "xml-decl-single-quotes",
+   "group": "xml-valid",
+   "hex": "3c3f786d6c2076657273696f6e3d27312e302720656e636f64696e673d275554462d38273f3e3c612f3e",
+   "expected": {
+    "ok": true,
+    "events": [
+     {
+      "format": 1,
+      "type": "xmlDecl",
+      "version": "1.0",
+      "encoding": "UTF-8",
+      "standalone": null
+     },
+     {
+      "format": 1,
+      "type": "start",
+      "name": "a",
+      "attributes": {}
+     },
+     {
+      "format": 1,
+      "type": "end",
+      "name": "a"
+     }
+    ]
+   }
+  },
+  {
+   "id": "xml-attr-single-quote",
+   "group": "xml-valid",
+   "hex": "3c6120783d2731272f3e",
+   "expected": {
+    "ok": true,
+    "events": [
+     {
+      "format": 1,
+      "type": "start",
+      "name": "a",
+      "attributes": {
+       "x": "1"
+      }
+     },
+     {
+      "format": 1,
+      "type": "end",
+      "name": "a"
+     }
+    ]
+   }
+  },
+  {
+   "id": "xml-attr-spaced",
+   "group": "xml-valid",
+   "hex": "3c7220613d22312220623d2232222f3e",
+   "expected": {
+    "ok": true,
+    "events": [
+     {
+      "format": 1,
+      "type": "start",
+      "name": "r",
+      "attributes": {
+       "a": "1",
+       "b": "2"
+      }
+     },
+     {
+      "format": 1,
+      "type": "end",
+      "name": "r"
+     }
+    ]
+   },
+   "reference": {
+    "ok": true,
+    "events": [
+     {
+      "format": 1,
+      "type": "start",
+      "name": "r",
+      "attributes": {
+       "a": "1",
+       "b": "2"
+      }
+     },
+     {
+      "format": 1,
+      "type": "end",
+      "name": "r"
+     }
+    ]
+   }
+  },
+  {
+   "id": "xml-attr-space-before-close",
+   "group": "xml-valid",
+   "hex": "3c7220613d22312220623d223222203e3c73202f3e3c2f723e",
+   "expected": {
+    "ok": true,
+    "events": [
+     {
+      "format": 1,
+      "type": "start",
+      "name": "r",
+      "attributes": {
+       "a": "1",
+       "b": "2"
+      }
+     },
+     {
+      "format": 1,
+      "type": "start",
+      "name": "s",
+      "attributes": {}
+     },
+     {
+      "format": 1,
+      "type": "end",
+      "name": "s"
+     },
+     {
+      "format": 1,
+      "type": "end",
+      "name": "r"
+     }
+    ]
+   },
+   "reference": {
+    "ok": true,
+    "events": [
+     {
+      "format": 1,
+      "type": "start",
+      "name": "r",
+      "attributes": {
+       "a": "1",
+       "b": "2"
+      }
+     },
+     {
+      "format": 1,
+      "type": "start",
+      "name": "s",
+      "attributes": {}
+     },
+     {
+      "format": 1,
+      "type": "end",
+      "name": "s"
+     },
+     {
+      "format": 1,
+      "type": "end",
+      "name": "r"
+     }
+    ]
+   }
+  },
+  {
+   "id": "xml-pi-spaces",
+   "group": "xml-valid",
+   "hex": "3c3f706920202061206220203f3e3c612f3e",
+   "expected": {
+    "ok": true,
+    "events": [
+     {
+      "format": 1,
+      "type": "pi",
+      "target": "pi",
+      "data": "a b  "
+     },
+     {
+      "format": 1,
+      "type": "start",
+      "name": "a",
+      "attributes": {}
+     },
+     {
+      "format": 1,
+      "type": "end",
+      "name": "a"
+     }
+    ]
+   }
+  },
+  {
+   "id": "xml-text-brackets",
+   "group": "xml-valid",
+   "hex": "3c613e5d205d3c2f613e",
+   "expected": {
+    "ok": true,
+    "events": [
+     {
+      "format": 1,
+      "type": "start",
+      "name": "a",
+      "attributes": {}
+     },
+     {
+      "format": 1,
+      "type": "text",
+      "data": "] ]"
+     },
+     {
+      "format": 1,
+      "type": "end",
+      "name": "a"
+     }
+    ]
+   }
+  },
+  {
+   "id": "xml-supplementary-text",
+   "group": "xml-valid",
+   "hex": "3c613ef09d849e3c2f613e",
+   "expected": {
+    "ok": true,
+    "events": [
+     {
+      "format": 1,
+      "type": "start",
+      "name": "a",
+      "attributes": {}
+     },
+     {
+      "format": 1,
+      "type": "text",
+      "data": "𝄞"
+     },
+     {
+      "format": 1,
+      "type": "end",
+      "name": "a"
+     }
+    ]
+   }
+  },
+  {
+   "id": "xml-supplementary-name",
+   "group": "xml-valid",
+   "hex": "3cf09d849e2f3e",
+   "reference": {
+    "ok": false,
+    "code": "INVALID_TOKEN"
+   },
+   "exception": "XML 1.0 Fifth Edition NameStartChar includes [#x10000-#xEFFFF], so a supplementary-plane name is accepted; this libexpat build rejects stateful 4-byte name characters with INVALID_TOKEN",
+   "expected": {
+    "ok": true,
+    "events": [
+     {
+      "format": 1,
+      "type": "start",
+      "name": "𝄞",
+      "attributes": {}
+     },
+     {
+      "format": 1,
+      "type": "end",
+      "name": "𝄞"
+     }
+    ]
+   }
+  },
+  {
+   "id": "bad-tag-mismatch",
+   "group": "xml-invalid",
+   "hex": "3c613e3c623e3c2f613e",
+   "expected": {
+    "ok": false,
+    "code": "TAG_MISMATCH",
+    "reason": "tagMismatch"
+   }
+  },
+  {
+   "id": "bad-duplicate-attr",
+   "group": "xml-invalid",
+   "hex": "3c6120783d22312220783d2232222f3e",
+   "expected": {
+    "ok": false,
+    "code": "DUPLICATE_ATTRIBUTE",
+    "reason": "duplicateAttribute"
+   }
+  },
+  {
+   "id": "bad-empty-name",
+   "group": "xml-invalid",
+   "hex": "3c202f3e",
+   "expected": {
+    "ok": false,
+    "code": "INVALID_TOKEN",
+    "reason": "invalidNameStart"
+   }
+  },
+  {
+   "id": "bad-stray-end",
+   "group": "xml-invalid",
+   "hex": "3c2f613e",
+   "expected": {
+    "ok": false,
+    "code": "INVALID_TOKEN",
+    "reason": "strayEndTag"
+   }
+  },
+  {
+   "id": "bad-extra-end",
+   "group": "xml-invalid",
+   "hex": "3c613e3c2f613e3c2f613e",
+   "expected": {
+    "ok": false,
+    "code": "INVALID_TOKEN",
+    "reason": "strayEndTag"
+   }
+  },
+  {
+   "id": "bad-cdata-end-in-text",
+   "group": "xml-invalid",
+   "hex": "3c613e5d5d3e3c2f613e",
+   "expected": {
+    "ok": false,
+    "code": "INVALID_TOKEN",
+    "reason": "cdataEndInText"
+   }
+  },
+  {
+   "id": "bad-double-hyphen",
+   "group": "xml-invalid",
+   "hex": "3c613e3c212d2d782d2d792d2d3e3c2f613e",
+   "expected": {
+    "ok": false,
+    "code": "INVALID_TOKEN",
+    "reason": "doubleHyphenInComment"
+   }
+  },
+  {
+   "id": "bad-comment-trailing-hyphen",
+   "group": "xml-invalid",
+   "hex": "3c613e3c212d2d782d2d2d3e3c2f613e",
+   "expected": {
+    "ok": false,
+    "code": "INVALID_TOKEN",
+    "reason": "doubleHyphenInComment"
+   }
+  },
+  {
+   "id": "bad-pi-target-xml",
+   "group": "xml-invalid",
+   "hex": "3c613e3c3f786d6c2076657273696f6e3d22312e30223f3e3c2f613e",
+   "expected": {
+    "ok": false,
+    "code": "MISPLACED_XML_PI",
+    "reason": "misplacedXmlDecl"
+   }
+  },
+  {
+   "id": "bad-pi-target-uppercase",
+   "group": "xml-invalid",
+   "hex": "3c613e3c3f584d4c20646174613f3e3c2f613e",
+   "expected": {
+    "ok": false,
+    "code": "INVALID_TOKEN",
+    "reason": "reservedPiTarget"
+   }
+  },
+  {
+   "id": "bad-undefined-entity",
+   "group": "xml-invalid",
+   "hex": "3c613e26666f6f3b3c2f613e",
+   "expected": {
+    "ok": false,
+    "code": "UNDEFINED_ENTITY",
+    "reason": "undefinedEntity"
+   }
+  },
+  {
+   "id": "bad-char-ref-zero",
+   "group": "xml-invalid",
+   "hex": "3c613e2623303b3c2f613e",
+   "expected": {
+    "ok": false,
+    "code": "BAD_CHAR_REF",
+    "reason": "badCharRef"
+   }
+  },
+  {
+   "id": "bad-char-ref-surrogate",
+   "group": "xml-invalid",
+   "hex": "3c613e262378443830303b3c2f613e",
+   "expected": {
+    "ok": false,
+    "code": "BAD_CHAR_REF",
+    "reason": "badCharRef"
+   }
+  },
+  {
+   "id": "bad-char-ref-fffe",
+   "group": "xml-invalid",
+   "hex": "3c613e262378464646453b3c2f613e",
+   "expected": {
+    "ok": false,
+    "code": "BAD_CHAR_REF",
+    "reason": "badCharRef"
+   }
+  },
+  {
+   "id": "bad-char-ref-too-big",
+   "group": "xml-invalid",
+   "hex": "3c613e2623783131303030303b3c2f613e",
+   "expected": {
+    "ok": false,
+    "code": "BAD_CHAR_REF",
+    "reason": "badCharRef"
+   }
+  },
+  {
+   "id": "bad-text-before-root",
+   "group": "xml-invalid",
+   "hex": "783c612f3e",
+   "expected": {
+    "ok": false,
+    "code": "INVALID_TOKEN",
+    "reason": "textBeforeRoot"
+   }
+  },
+  {
+   "id": "bad-junk-after-root",
+   "group": "xml-invalid",
+   "hex": "3c612f3e78",
+   "expected": {
+    "ok": false,
+    "code": "JUNK_AFTER_DOC_ELEMENT",
+    "reason": "textAfterRoot"
+   }
+  },
+  {
+   "id": "bad-second-root",
+   "group": "xml-invalid",
+   "hex": "3c612f3e3c622f3e",
+   "expected": {
+    "ok": false,
+    "code": "JUNK_AFTER_DOC_ELEMENT",
+    "reason": "junkAfterRoot"
+   }
+  },
+  {
+   "id": "bad-raw-lt-attr",
+   "group": "xml-invalid",
+   "hex": "3c6120783d223c222f3e",
+   "expected": {
+    "ok": false,
+    "code": "INVALID_TOKEN",
+    "reason": "ltInAttribute"
+   }
+  },
+  {
+   "id": "bad-unquoted-attr",
+   "group": "xml-invalid",
+   "hex": "3c6120783d312f3e",
+   "expected": {
+    "ok": false,
+    "code": "INVALID_TOKEN",
+    "reason": "unquotedAttribute"
+   }
+  },
+  {
+   "id": "bad-attr-missing-separator",
+   "group": "xml-invalid",
+   "hex": "3c7220613d223122623d2232222f3e",
+   "expected": {
+    "ok": false,
+    "code": "INVALID_TOKEN",
+    "reason": "missingAttributeSeparator"
+   },
+   "reference": {
+    "ok": false,
+    "code": "INVALID_TOKEN"
+   }
+  },
+  {
+   "id": "bad-malformed-decl",
+   "group": "xml-invalid",
+   "hex": "3c3f786d6c20656e636f64696e673d225554462d38223f3e3c612f3e",
+   "expected": {
+    "ok": false,
+    "code": "XML_DECL",
+    "reason": "xmlDeclVersion"
+   }
+  },
+  {
+   "id": "bad-version-2",
+   "group": "xml-invalid",
+   "hex": "3c3f786d6c2076657273696f6e3d22322e30223f3e3c612f3e",
+   "expected": {
+    "ok": false,
+    "code": "XML_DECL",
+    "reason": "xmlDeclVersionValue"
+   }
+  },
+  {
+   "id": "bad-two-decls",
+   "group": "xml-invalid",
+   "hex": "3c3f786d6c2076657273696f6e3d22312e30223f3e3c3f786d6c2076657273696f6e3d22312e30223f3e3c612f3e",
+   "expected": {
+    "ok": false,
+    "code": "MISPLACED_XML_PI",
+    "reason": "misplacedXmlDecl"
+   }
+  },
+  {
+   "id": "bad-empty-document",
+   "group": "xml-invalid",
+   "hex": "",
+   "expected": {
+    "ok": false,
+    "code": "NO_ELEMENTS",
+    "reason": "noRoot"
+   }
+  },
+  {
+   "id": "bad-whitespace-only",
+   "group": "xml-invalid",
+   "hex": "200a20",
+   "expected": {
+    "ok": false,
+    "code": "NO_ELEMENTS",
+    "reason": "noRoot"
+   }
+  },
+  {
+   "id": "bad-unclosed-element",
+   "group": "xml-invalid",
+   "hex": "3c613e",
+   "expected": {
+    "ok": false,
+    "code": "NO_ELEMENTS",
+    "reason": "unclosedElement"
+   }
+  },
+  {
+   "id": "bad-unclosed-comment",
+   "group": "xml-invalid",
+   "hex": "3c613e3c212d2d2078",
+   "expected": {
+    "ok": false,
+    "code": "UNCLOSED_TOKEN",
+    "reason": "unclosedComment"
+   }
+  },
+  {
+   "id": "bad-unclosed-pi",
+   "group": "xml-invalid",
+   "hex": "3c613e3c3f70692078",
+   "expected": {
+    "ok": false,
+    "code": "UNCLOSED_TOKEN",
+    "reason": "unclosedPi"
+   }
+  },
+  {
+   "id": "bad-unclosed-cdata",
+   "group": "xml-invalid",
+   "hex": "3c613e3c215b43444154415b78",
+   "expected": {
+    "ok": false,
+    "code": "UNCLOSED_CDATA_SECTION",
+    "reason": "unclosedCdata"
+   }
+  },
+  {
+   "id": "bad-unclosed-decl",
+   "group": "xml-invalid",
+   "hex": "3c3f786d6c2076657273696f6e3d22312e3022",
+   "expected": {
+    "ok": false,
+    "code": "UNCLOSED_TOKEN",
+    "reason": "unclosedXmlDecl"
+   }
+  },
+  {
+   "id": "bad-nul-byte",
+   "group": "xml-invalid",
+   "hex": "3c613e003c2f613e",
+   "expected": {
+    "ok": false,
+    "code": "INVALID_TOKEN",
+    "reason": "illegalXmlChar"
+   }
+  },
+  {
+   "id": "bad-fffe-literal",
+   "group": "xml-invalid",
+   "hex": "3c613eefbfbe3c2f613e",
+   "expected": {
+    "ok": false,
+    "code": "INVALID_TOKEN",
+    "reason": "illegalXmlChar"
+   }
+  },
+  {
+   "id": "bad-unknown-markup",
+   "group": "xml-invalid",
+   "hex": "3c21454e544954592078202279223e3c612f3e",
+   "expected": {
+    "ok": false,
+    "code": "SYNTAX",
+    "reason": "unknownMarkup"
+   }
+  },
+  {
+   "id": "bad-cdata-in-prolog",
+   "group": "xml-invalid",
+   "hex": "3c215b43444154415b785d5d3e3c612f3e",
+   "expected": {
+    "ok": false,
+    "code": "SYNTAX",
+    "reason": "unknownMarkup"
+   }
+  },
+  {
+   "id": "bad-middot-name",
+   "group": "xml-invalid",
+   "hex": "3cc2b72f3e",
+   "expected": {
+    "ok": false,
+    "code": "INVALID_TOKEN",
+    "reason": "invalidNameStart"
+   }
+  },
+  {
+   "id": "bad-doctype-plain",
+   "group": "xml-invalid",
+   "hex": "3c21444f435459504520613e3c612f3e",
+   "reference": {
+    "ok": true,
+    "events": [
+     {
+      "format": 1,
+      "type": "start",
+      "name": "a",
+      "attributes": {}
+     },
+     {
+      "format": 1,
+      "type": "end",
+      "name": "a"
+     }
+    ]
+   },
+   "exception": "every DOCTYPE is refused locally as unsupportedDtd without reading the declaration; Expat accepts this one",
+   "expected": {
+    "ok": false,
+    "code": "UNSUPPORTED_DTD",
+    "reason": "unsupportedDtd"
+   }
+  },
+  {
+   "id": "bad-doctype-system",
+   "group": "xml-invalid",
+   "file": "tests/corpus/doctype-system.xml",
+   "reference": {
+    "ok": true,
+    "events": [
+     {
+      "format": 1,
+      "type": "start",
+      "name": "a",
+      "attributes": {}
+     },
+     {
+      "format": 1,
+      "type": "end",
+      "name": "a"
+     }
+    ]
+   },
+   "exception": "a DOCTYPE with a SYSTEM identifier is refused before the identifier is read; Expat accepts it and never fetches the external subset",
+   "expected": {
+    "ok": false,
+    "code": "UNSUPPORTED_DTD",
+    "reason": "unsupportedDtd"
+   }
+  },
+  {
+   "id": "bad-doctype-entity",
+   "group": "xml-invalid",
+   "hex": "3c21444f43545950452061205b3c21454e544954592078202279223e5d3e3c613e26783b3c2f613e",
+   "reference": {
+    "ok": true,
+    "events": [
+     {
+      "format": 1,
+      "type": "start",
+      "name": "a",
+      "attributes": {}
+     },
+     {
+      "format": 1,
+      "type": "text",
+      "data": "y"
+     },
+     {
+      "format": 1,
+      "type": "end",
+      "name": "a"
+     }
+    ]
+   },
+   "exception": "an internal-subset entity declaration is refused with the whole DOCTYPE; Expat expands the entity",
+   "expected": {
+    "ok": false,
+    "code": "UNSUPPORTED_DTD",
+    "reason": "unsupportedDtd"
+   }
+  },
+  {
+   "id": "bad-doctype-external-pe",
+   "group": "xml-invalid",
+   "hex": "3c21444f43545950452061205b3c21454e54495459202520702053595354454d2022687474703a2f2f6578616d706c652e696e76616c69642f702e647464223e2025703b5d3e3c612f3e",
+   "reference": {
+    "ok": true,
+    "events": [
+     {
+      "format": 1,
+      "type": "start",
+      "name": "a",
+      "attributes": {}
+     },
+     {
+      "format": 1,
+      "type": "end",
+      "name": "a"
+     }
+    ]
+   },
+   "exception": "a parameter entity with an external identifier is refused before any identifier is read; Expat does not resolve it either",
+   "expected": {
+    "ok": false,
+    "code": "UNSUPPORTED_DTD",
+    "reason": "unsupportedDtd"
+   }
+  },
+  {
+   "id": "limit-input-exact",
+   "group": "limits",
+   "pattern": {
+    "prefix": "",
+    "repeatByte": "20",
+    "repeatCount": 8388604,
+    "suffix": "3c612f3e"
+   },
+   "expected": {
+    "ok": true,
+    "events": [
+     {
+      "format": 1,
+      "type": "start",
+      "name": "a",
+      "attributes": {}
+     },
+     {
+      "format": 1,
+      "type": "end",
+      "name": "a"
+     }
+    ]
+   }
+  },
+  {
+   "id": "limit-input-over",
+   "group": "limits",
+   "pattern": {
+    "prefix": "",
+    "repeatByte": "20",
+    "repeatCount": 8388605,
+    "suffix": "3c612f3e"
+   },
+   "reference": {
+    "ok": true,
+    "events": [
+     {
+      "format": 1,
+      "type": "start",
+      "name": "a",
+      "attributes": {}
+     },
+     {
+      "format": 1,
+      "type": "end",
+      "name": "a"
+     }
+    ]
+   },
+   "exception": "8388609 input bytes exceed the 8 MiB raw-input budget and are refused before decoding; the oracle has no such budget",
+   "expected": {
+    "ok": false,
+    "code": "LIMIT_INPUT",
+    "reason": "limitInput"
+   }
+  },
+  {
+   "id": "limit-token-exact",
+   "group": "limits",
+   "pattern": {
+    "prefix": "3c613e",
+    "repeatByte": "78",
+    "repeatCount": 1048576,
+    "suffix": "3c2f613e"
+   },
+   "expected": {
+    "ok": true,
+    "events": [
+     {
+      "format": 1,
+      "type": "start",
+      "name": "a",
+      "attributes": {}
+     },
+     {
+      "format": 1,
+      "type": "text",
+      "dataRepeat": {
+       "char": "x",
+       "count": 1048576
+      }
+     },
+     {
+      "format": 1,
+      "type": "end",
+      "name": "a"
+     }
+    ]
+   }
+  },
+  {
+   "id": "limit-token-over",
+   "group": "limits",
+   "pattern": {
+    "prefix": "3c613e",
+    "repeatByte": "78",
+    "repeatCount": 1048577,
+    "suffix": "3c2f613e"
+   },
+   "reference": {
+    "ok": true,
+    "events": [
+     {
+      "format": 1,
+      "type": "start",
+      "name": "a",
+      "attributes": {}
+     },
+     {
+      "format": 1,
+      "type": "text",
+      "dataRepeat": {
+       "char": "x",
+       "count": 1048577
+      }
+     },
+     {
+      "format": 1,
+      "type": "end",
+      "name": "a"
+     }
+    ]
+   },
+   "exception": "one text accumulation of 1048577 characters exceeds the 1 MiB token budget; the oracle has no such budget",
+   "expected": {
+    "ok": false,
+    "code": "LIMIT_TOKEN",
+    "reason": "limitToken"
+   }
+  },
+  {
+   "id": "limit-decl-name-exact",
+   "group": "limits",
+   "pattern": {
+    "prefix": "3c3f786d6c20",
+    "repeatByte": "61",
+    "repeatCount": 1048576,
+    "suffix": "3f3e"
+   },
+   "expected": {
+    "ok": false,
+    "code": "XML_DECL",
+    "reason": "xmlDeclVersion"
+   },
+   "reference": {
+    "ok": false,
+    "code": "XML_DECL"
+   }
+  },
+  {
+   "id": "limit-decl-name-over",
+   "group": "limits",
+   "pattern": {
+    "prefix": "3c3f786d6c20",
+    "repeatByte": "61",
+    "repeatCount": 1048577,
+    "suffix": "3f3e"
+   },
+   "expected": {
+    "ok": false,
+    "code": "LIMIT_TOKEN",
+    "reason": "limitToken"
+   },
+   "reference": {
+    "ok": false,
+    "code": "XML_DECL"
+   },
+   "exception": "the declaration pseudo-attribute name of 1048577 characters exceeds the 1 MiB token budget; the oracle has no such budget"
+  },
+  {
+   "id": "limit-depth-exact",
+   "group": "limits",
+   "nested": {
+    "depth": 256
+   },
+   "expected": {
+    "ok": true,
+    "nestingEvents": {
+     "depth": 256
+    }
+   }
+  },
+  {
+   "id": "limit-depth-over",
+   "group": "limits",
+   "nested": {
+    "depth": 257
+   },
+   "reference": {
+    "ok": true,
+    "nestingEvents": {
+     "depth": 257
+    }
+   },
+   "exception": "257 open elements exceed the 256-element nesting budget before the 257th element is pushed; the oracle has no nesting budget",
+   "expected": {
+    "ok": false,
+    "code": "LIMIT_DEPTH",
+    "reason": "limitDepth"
+   }
+  },
+  {
+   "id": "limit-expansion-exact",
+   "group": "limits",
+   "refs": {
+    "count": 1048576,
+    "perText": 1024
+   },
+   "expected": {
+    "ok": true,
+    "openingEvents": [
+     {
+      "format": 1,
+      "type": "start",
+      "name": "root",
+      "attributes": {}
+     }
+    ],
+    "repeatEvents": {
+     "count": 1024,
+     "events": [
+      {
+       "format": 1,
+       "type": "start",
+       "name": "e",
+       "attributes": {}
+      },
+      {
+       "format": 1,
+       "type": "text",
+       "dataRepeat": {
+        "char": "A",
+        "count": 1024
+       }
+      },
+      {
+       "format": 1,
+       "type": "end",
+       "name": "e"
+      }
+     ]
+    },
+    "closingEvents": [
+     {
+      "format": 1,
+      "type": "end",
+      "name": "root"
+     }
+    ]
+   }
+  },
+  {
+   "id": "limit-expansion-over",
+   "group": "limits",
+   "refs": {
+    "count": 1048577,
+    "perText": 1024
+   },
+   "reference": {
+    "ok": true,
+    "openingEvents": [
+     {
+      "format": 1,
+      "type": "start",
+      "name": "root",
+      "attributes": {}
+     }
+    ],
+    "repeatEvents": {
+     "count": 1024,
+     "events": [
+      {
+       "format": 1,
+       "type": "start",
+       "name": "e",
+       "attributes": {}
+      },
+      {
+       "format": 1,
+       "type": "text",
+       "dataRepeat": {
+        "char": "A",
+        "count": 1024
+       }
+      },
+      {
+       "format": 1,
+       "type": "end",
+       "name": "e"
+      }
+     ],
+     "extraEvents": [
+      {
+       "format": 1,
+       "type": "start",
+       "name": "e",
+       "attributes": {}
+      },
+      {
+       "format": 1,
+       "type": "text",
+       "dataRepeat": {
+        "char": "A",
+        "count": 1
+       }
+      },
+      {
+       "format": 1,
+       "type": "end",
+       "name": "e"
+      }
+     ]
+    },
+    "closingEvents": [
+     {
+      "format": 1,
+      "type": "end",
+      "name": "root"
+     }
+    ]
+   },
+   "exception": "1048577 reference-expanded characters exceed the 1 MiB cumulative reference budget; each text run stays at or below 1024 characters, and the reference budget is checked before the 1048577th append, so the failing budget is the expansion budget and not the token budget; the oracle has no reference budget",
+   "expected": {
+    "ok": false,
+    "code": "LIMIT_ENTITY_EXPANSION",
+    "reason": "limitEntityExpansion"
+   }
+  },
+  {
+   "id": "trace-basic",
+   "group": "trace",
+   "file": "tests/corpus/basic.xml",
+   "expectedFile": "tests/corpus/basic.jsonl",
+   "exactTrace": true
+  },
+  {
+   "id": "trace-malformed",
+   "group": "trace",
+   "file": "tests/corpus/malformed.xml",
+   "expectedFile": "tests/corpus/malformed.jsonl",
+   "exactTrace": true
+  }
+ ]
+}
