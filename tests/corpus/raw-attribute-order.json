@@ -1,0 +1,23 @@
+{
+  "format": 1,
+  "cases": {
+    "xml-basic": [
+      {"eventIndex": 2, "keys": ["z", "a"]}
+    ],
+    "xml-attr-normalization": [
+      {"eventIndex": 0, "keys": ["tab", "ws", "literal", "crlf", "numeric-cr"]}
+    ],
+    "xml-namespace-raw": [
+      {"eventIndex": 0, "keys": ["xmlns:p", "p:b"]}
+    ],
+    "xml-attr-spaced": [
+      {"eventIndex": 0, "keys": ["a", "b"]}
+    ],
+    "xml-attr-space-before-close": [
+      {"eventIndex": 0, "keys": ["a", "b"]}
+    ],
+    "trace-basic": [
+      {"eventIndex": 2, "keys": ["z", "a"]}
+    ]
+  }
+}

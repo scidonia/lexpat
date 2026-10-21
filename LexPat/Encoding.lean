@@ -11,7 +11,10 @@ Encoding selection is byte-evidence first: a BOM or a zero-byte UTF-16
 signature decides the encoding, and otherwise an ASCII-compatible XML
 declaration may name ISO-8859-1 or US-ASCII. A declaration can never
 contradict the byte evidence: the document parser re-checks the declaration's
-`encoding` value against the encoding actually used.
+`encoding` value against the encoding actually used. `LexPat.Stream` performs
+this decision once, from a bounded undecided prefix, and reuses the decoders
+and the declaration-label scanner here; `detectSignature`,
+`scanDeclLabel` and the per-scalar decoders are the pieces it shares.
 -/
 import LexPat.Types
 import LexPat.Lexer
@@ -184,25 +187,6 @@ def decodeUtf8One (data : ByteArray) (i : Nat) : Except DecodeError (Scalar × N
     else
       .error ⟨.outOfRange, i⟩
 
-/-- Decode the whole byte range as UTF-8, recording each scalar's byte offset. -/
-def decodeUtf8From (data : ByteArray) (start : Nat) : Except DecodeError (Array DecodedChar) :=
-  Id.run do
-    let mut i := start
-    let mut acc : Array DecodedChar := #[]
-    let mut err : Option DecodeError := none
-    while err.isNone && decide (i < data.size) do
-      match decodeUtf8One data i with
-      | .ok (s, next) =>
-        if next ≤ i then
-          err := some ⟨.invalidLead, i⟩
-        else
-          acc := acc.push ⟨s, i⟩
-          i := next
-      | .error e => err := some e
-    match err with
-    | some e => return .error e
-    | none => return .ok acc
-
 /-- The 16-bit code unit at a byte pair, in the requested byte order. -/
 def utf16Unit (bigEndian : Bool) (b0 b1 : UInt8) : Nat :=
   if bigEndian then b0.toNat * 0x100 + b1.toNat else b1.toNat * 0x100 + b0.toNat
@@ -249,26 +233,6 @@ def decodeUtf16One (data : ByteArray) (bigEndian : Bool) (i : Nat) :
           i + 2)
   | _, _ => .error ⟨.oddUtf16Length, i⟩
 
-/-- Decode the whole byte range as UTF-16 in the given byte order. -/
-def decodeUtf16From (data : ByteArray) (start : Nat) (bigEndian : Bool) :
-    Except DecodeError (Array DecodedChar) :=
-  Id.run do
-    let mut i := start
-    let mut acc : Array DecodedChar := #[]
-    let mut err : Option DecodeError := none
-    while err.isNone && decide (i < data.size) do
-      match decodeUtf16One data bigEndian i with
-      | .ok (s, next) =>
-        if next ≤ i then
-          err := some ⟨.oddUtf16Length, i⟩
-        else
-          acc := acc.push ⟨s, i⟩
-          i := next
-      | .error e => err := some e
-    match err with
-    | some e => return .error e
-    | none => return .ok acc
-
 /-- Decode `[start, stop)` as ISO-8859-1: every byte is the scalar of its value. -/
 def decodeLatin1Range (data : ByteArray) (start stop : Nat) : Array DecodedChar :=
   Id.run do
@@ -283,30 +247,6 @@ def decodeLatin1Range (data : ByteArray) (start stop : Nat) : Array DecodedChar 
       | none => pure ()
       i := i + 1
     return acc
-
-def decodeLatin1From (data : ByteArray) (start : Nat) : Array DecodedChar :=
-  decodeLatin1Range data start data.size
-
-/-- Decode the whole byte range as US-ASCII. -/
-def decodeAsciiFrom (data : ByteArray) (start : Nat) : Except DecodeError (Array DecodedChar) :=
-  Id.run do
-    let mut i := start
-    let mut acc : Array DecodedChar := #[]
-    let mut err : Option DecodeError := none
-    while err.isNone && decide (i < data.size) do
-      match data[i]? with
-      | some b =>
-        if b.toNat < 0x80 then
-          acc := acc.push ⟨⟨b.toNat, Or.inl (by
-            have hb : b.toNat < 256 := UInt8.toNat_lt b
-            omega)⟩, i⟩
-          i := i + 1
-        else
-          err := some ⟨.invalidAscii, i⟩
-      | none => pure ()
-    match err with
-    | some e => return .error e
-    | none => return .ok acc
 
 /-- Encoding names we recognize, before checking them against the byte
 evidence. -/
@@ -330,11 +270,6 @@ def classifyLabel (label : String) : LabelKind :=
   | "utf-16le" => .utf16le
   | "utf-16be" => .utf16be
   | _ => .unknown
-
-/-- A decoded document: the encoding used and the scalars it produced. -/
-structure DecodedDocument where
-  encoding : Encoding
-  chars : Array DecodedChar
 
 /-- Byte-order-mark and zero-byte UTF-16 signature detection. Detection comes
 before any declaration is read, so a document's declaration cannot choose a
@@ -383,44 +318,5 @@ def scanDeclLabel (data : ByteArray) (limit : Nat) : Option String :=
     LexPat.scanDeclEncodingLabel (decodeLatin1Range data 0 stop)
   else
     none
-
-def decodeWith (enc : Encoding) (data : ByteArray) (off : Nat) :
-    Except DecodeError DecodedDocument :=
-  match enc with
-  | .utf8 =>
-    match decodeUtf8From data off with
-    | .ok chars => .ok ⟨.utf8, chars⟩
-    | .error e => .error e
-  | .utf16le =>
-    match decodeUtf16From data off false with
-    | .ok chars => .ok ⟨.utf16le, chars⟩
-    | .error e => .error e
-  | .utf16be =>
-    match decodeUtf16From data off true with
-    | .ok chars => .ok ⟨.utf16be, chars⟩
-    | .error e => .error e
-  | .latin1 => .ok ⟨.latin1, decodeLatin1From data off⟩
-  | .ascii =>
-    match decodeAsciiFrom data off with
-    | .ok chars => .ok ⟨.ascii, chars⟩
-    | .error e => .error e
-
-/-- Decode a document, choosing an encoding from byte evidence first and from
-an ASCII-compatible declaration second. -/
-def decodeDocument (data : ByteArray) (limits : Limits) : Except DecodeError DecodedDocument :=
-  match detectSignature data with
-  | some (enc, off) => decodeWith enc data off
-  | none =>
-    match scanDeclLabel data limits.maxTokenChars with
-    | none => decodeWith .utf8 data 0
-    | some label =>
-      match classifyLabel label with
-      | .utf8 => decodeWith .utf8 data 0
-      | .ascii => decodeWith .ascii data 0
-      | .latin1 => decodeWith .latin1 data 0
-      | .utf16 => .error ⟨.encodingMismatch, 0⟩
-      | .utf16le => .error ⟨.encodingMismatch, 0⟩
-      | .utf16be => .error ⟨.encodingMismatch, 0⟩
-      | .unknown => .error ⟨.unknownEncoding, 0⟩
 
 end LexPat

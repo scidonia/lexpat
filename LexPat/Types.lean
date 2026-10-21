@@ -193,6 +193,6 @@ inductive Event where
   | cdataEnd
   | comment (data : String)
   | pi (target : String) (data : String)
-deriving Repr
+deriving Repr, DecidableEq, BEq
 
 end LexPat

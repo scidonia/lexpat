@@ -4,12 +4,19 @@ import LexPat
 
 It reads one binary XML file under the library's default budgets and writes
 deterministic JSON Lines to standard output. Every object carries `"format":1`.
-It is not a production integration route, and neither is any other surface in
-this milestone: `LexPat.parseDocument` is the library's entry point for
-inspection and later design, not a supported integration route. This executable
-exists so documents and their traces can be compared against libexpat.
--/
 
+The default mode is the one-shot trace: the whole file is parsed and either the
+document's events or a single error result is printed. The structural
+`--chunk-size` modes feed the same bytes to `LexPat.Stream` and print each
+event as soon as it is returned, so they demonstrate the resumable core and
+chunk-boundary invariance. A rejected stream may already have printed prefix
+events; the one-shot mode cannot.
+
+This executable is a demonstration and differential fixture, not a production
+integration route, and neither is any other surface in this milestone:
+`LexPat.parseDocument` and `LexPat.Stream` exist for inspection and later
+design, not as supported integration routes.
+-/
 
 namespace LexPat.Trace
 
@@ -83,14 +90,38 @@ def renderResultError (e : ParseError) : String :=
 
 def usage : String :=
   "usage: lexpatTrace <file>\n" ++
+    "       lexpatTrace --chunk-size N <file>\n" ++
+    "       lexpatTrace --chunk-size whole <file>\n" ++
+    "       lexpatTrace --chunk-size N --chunk-seed SEED <file>\n" ++
     "       lexpatTrace --help\n" ++
     "\n" ++
-    "Reads at most 8388609 bytes of <file> and writes JSON Lines to stdout.\n" ++
+    "Reads one binary XML file and writes JSON Lines to stdout.\n" ++
+    "The default and whole modes read at most 8388609 bytes; numeric and\n" ++
+    "seeded modes read 64 KiB blocks and stop once the stream is terminal.\n" ++
     "Every object carries \"format\":1; the last object is a result.\n" ++
     "Exit status: 0 accepted, 1 rejected, 2 usage or I/O error.\n"
 
 def help : String :=
   usage ++ "\n" ++
+    "modes:\n" ++
+    "  <file>                    one-shot parse (the default trace)\n" ++
+    "  --chunk-size N             feed the file in N-byte chunks;\n" ++
+    "                             N is a decimal integer in [1,65536]\n" ++
+    "  --chunk-size whole         feed the file in one chunk\n" ++
+    "  --chunk-size N --chunk-seed SEED\n" ++
+    "                             N as above and SEED a decimal integer in\n" ++
+    "                             [0,4294967295]; lengths vary per feed:\n" ++
+    "                             s := (1664525*s + 1013904223) mod 4294967296\n" ++
+    "                             once per feed, then length 1 + s mod N\n" ++
+    "                             (a final shorter chunk may carry the tail)\n" ++
+    "  A nondecimal or out-of-range number, --chunk-seed without a numeric\n" ++
+    "  --chunk-size, and --chunk-size whole with --chunk-seed are usage\n" ++
+    "  errors (exit 2); no flag is silently ignored.\n" ++
+    "\n" ++
+    "Streaming modes print each event as it is returned and then one result.\n" ++
+    "A rejected stream may already have printed prefix events; the one-shot\n" ++
+    "mode returns no event array on rejection.\n" ++
+    "\n" ++
     "limits (defaults, not configurable by this executable):\n" ++
     "  raw input              8388608 bytes\n" ++
     "  one name/value/text/  1048576 characters\n" ++
@@ -106,8 +137,7 @@ def help : String :=
     "\n" ++
     "not supported (rejected, never simulated):\n" ++
     "  DOCTYPE and any DTD, non-predefined named entities, external entities,\n" ++
-    "  namespace URI processing, other encodings, XML 1.1, streaming input,\n" ++
-    "  and the C API.\n" ++
+    "  namespace URI processing, other encodings, XML 1.1 and the C API.\n" ++
     "\n" ++
     "This executable is a demonstration and differential fixture, not a\n" ++
     "supported production integration route.\n"
@@ -132,6 +162,42 @@ def readBounded (path : System.FilePath) (cap : Nat) : IO ByteArray :=
           | none => pure ()
     return ByteArray.mk acc
 
+/-- Fill a block of `want` bytes, or stop at end of file. Short incidental
+reads do not change the partition. -/
+def readBlock (h : IO.FS.Handle) (want : Nat) : IO ByteArray := do
+  let mut acc : ByteArray := ByteArray.empty
+  let mut done := false
+  while !done && acc.size < want do
+    let need := want - acc.size
+    let chunk ← h.read (USize.ofNat need)
+    if chunk.size == 0 then
+      done := true
+    else
+      acc := acc ++ chunk
+  return acc
+
+def printEvents (stdout : IO.FS.Stream) (evs : Array Event) : IO Unit := do
+  for ev in evs do
+    stdout.putStr (renderEvent ev ++ "\n")
+
+/-- Print the terminal result and exit 1 when it is an error. `finish` is
+inert on an already terminal stream, so one result is always printed. -/
+def finishAndPrint (stdout : IO.FS.Stream) (st : Stream) : IO Unit := do
+  let (st2, evs) := Stream.finish st
+  printEvents stdout evs
+  match Stream.result st2 with
+  | some (.ok ()) =>
+    stdout.putStr (renderResultOk ++ "\n")
+    stdout.flush
+  | some (.error e) =>
+    stdout.putStr (renderResultError e ++ "\n")
+    stdout.flush
+    IO.Process.exit 1
+  | none =>
+    IO.eprintln "lexpatTrace: stream did not finish"
+    IO.Process.exit 2
+
+/-- The default one-shot trace. -/
 def runFile (path : System.FilePath) : IO Unit := do
   let limits : Limits := {}
   let cap := limits.maxInputBytes + 1
@@ -153,6 +219,155 @@ def runFile (path : System.FilePath) : IO Unit := do
     stdout.flush
     IO.Process.exit 1
 
+/-- One feed of the whole bounded input. -/
+def runWhole (path : System.FilePath) : IO Unit := do
+  let limits : Limits := {}
+  let cap := limits.maxInputBytes + 1
+  let bytes ←
+    try
+      readBounded path cap
+    catch e =>
+      IO.eprintln s!"lexpatTrace: cannot read {path}: {e}"
+      IO.Process.exit 2
+  let stdout ← IO.getStdout
+  let (st, evs) := Stream.feed (Stream.new limits) bytes
+  printEvents stdout evs
+  finishAndPrint stdout st
+
+/-- Feed fixed `size`-byte chunks assembled from 64 KiB IO blocks. -/
+def runFixed (path : System.FilePath) (size : Nat) : IO Unit := do
+  let stdout ← IO.getStdout
+  let limits : Limits := {}
+  let st ←
+    try
+      IO.FS.withFile path .read fun h => do
+        let mut state := Stream.new limits
+        let mut carry : ByteArray := ByteArray.empty
+        let mut done := false
+        while !done do
+          let block ← readBlock h 65536
+          let data := carry ++ block
+          let mut pos := 0
+          let mut stop := false
+          while !stop && data.size - pos ≥ size do
+            let piece := data.extract pos (pos + size)
+            pos := pos + size
+            let (state1, evs) := Stream.feed state piece
+            state := state1
+            printEvents stdout evs
+            match Stream.result state with
+            | some _ => stop := true
+            | none => pure ()
+          carry := data.extract pos data.size
+          if block.size == 0 then
+            if !stop && carry.size > 0 then
+              let (state1, evs) := Stream.feed state carry
+              state := state1
+              printEvents stdout evs
+            done := true
+          else if stop then
+            done := true
+        return state
+    catch e =>
+      IO.eprintln s!"lexpatTrace: cannot read {path}: {e}"
+      IO.Process.exit 2
+  finishAndPrint stdout st
+
+/-- Feed chunks whose length is drawn from the specified PRNG rule. -/
+def runSeeded (path : System.FilePath) (size seed : Nat) : IO Unit := do
+  let stdout ← IO.getStdout
+  let limits : Limits := {}
+  let st ←
+    try
+      IO.FS.withFile path .read fun h => do
+        let mut state := Stream.new limits
+        let mut carry : ByteArray := ByteArray.empty
+        let mut prng := seed
+        let mut done := false
+        while !done do
+          let block ← readBlock h 65536
+          let data := carry ++ block
+          let mut pos := 0
+          let mut stop := false
+          while !stop do
+            let nextPrng := (1664525 * prng + 1013904223) % 4294967296
+            let len := 1 + nextPrng % size
+            if data.size - pos ≥ len then
+              prng := nextPrng
+              let piece := data.extract pos (pos + len)
+              pos := pos + len
+              let (state1, evs) := Stream.feed state piece
+              state := state1
+              printEvents stdout evs
+              match Stream.result state with
+              | some _ => stop := true
+              | none => pure ()
+            else
+              stop := true
+          carry := data.extract pos data.size
+          if block.size == 0 then
+            if carry.size > 0 then
+              prng := (1664525 * prng + 1013904223) % 4294967296
+              let (state1, evs) := Stream.feed state carry
+              state := state1
+              printEvents stdout evs
+            done := true
+          else
+            match Stream.result state with
+            | some _ => done := true
+            | none => pure ()
+        return state
+    catch e =>
+      IO.eprintln s!"lexpatTrace: cannot read {path}: {e}"
+      IO.Process.exit 2
+  finishAndPrint stdout st
+
+/-- A decimal integer, or `none` for empty, signed, or nondecimal text. -/
+def parseDecimal (s : String) : Option Nat :=
+  if s.isEmpty then none
+  else
+    Id.run do
+      let mut acc := 0
+      let mut ok := true
+      for c in s.toList do
+        let d := c.toNat
+        if d < 0x30 || d > 0x39 then
+          ok := false
+        else
+          acc := acc * 10 + (d - 0x30)
+      if ok then return some acc else return none
+
+/-- The structural chunk modes accepted on the command line. -/
+inductive ChunkSpec where
+  | whole
+  | fixed (size : Nat)
+  | seeded (size : Nat) (seed : Nat)
+deriving Repr
+
+/-- Parse `--chunk-size`/`--chunk-seed` arguments. Any unsupported combination
+is a usage error rather than an ignored flag. -/
+def parseChunkSpec (sizeArg : String) (seedArg : Option String) : Option ChunkSpec :=
+  if sizeArg == "whole" then
+    match seedArg with
+    | none => some .whole
+    | some _ => none
+  else
+    match parseDecimal sizeArg with
+    | some n =>
+      if n ≥ 1 && n ≤ 65536 then
+        match seedArg with
+        | none => some (.fixed n)
+        | some seedText =>
+          match parseDecimal seedText with
+          | some seed => if seed ≤ 4294967295 then some (.seeded n seed) else none
+          | none => none
+      else none
+    | none => none
+
+def usageError : IO Unit := do
+  IO.eprintln usage
+  IO.Process.exit 2
+
 def runMain (args : List String) : IO Unit := do
   match args with
   | ["--help"] =>
@@ -160,9 +375,19 @@ def runMain (args : List String) : IO Unit := do
     stdout.putStr help
     stdout.flush
   | [path] => runFile path
-  | _ =>
-    IO.eprintln usage
-    IO.Process.exit 2
+  | ["--chunk-size", sizeArg, path] =>
+    match parseChunkSpec sizeArg none with
+    | some .whole => runWhole path
+    | some (.fixed n) => runFixed path n
+    | some (.seeded _ _) => usageError
+    | none => usageError
+  | ["--chunk-size", sizeArg, "--chunk-seed", seedArg, path] =>
+    match parseChunkSpec sizeArg (some seedArg) with
+    | some (.seeded n seed) => runSeeded path n seed
+    | some .whole => usageError
+    | some (.fixed _) => usageError
+    | none => usageError
+  | _ => usageError
 
 end LexPat.Trace
 

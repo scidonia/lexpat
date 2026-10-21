@@ -29,7 +29,11 @@ Normalization rules used when comparing traces:
 * empty text events are not emitted;
 * attribute sets are compared as a map canonicalized by raw name, while event
   order and parsed attribute order stay document order;
-* error prose and byte offsets are never compared.
+* error prose and byte offsets are never compared;
+* chunk boundaries do not change event boundaries: a text run is emitted at the
+  next `<` or at a successful EOF, never because a chunk ended, and a CDATA
+  section emits `cdataStart` at its opener and its text plus `cdataEnd` at
+  `]]>`.
 
 Line endings inside character data, CDATA, comments and PI data are normalized
 to `LF`. In attribute values, literal `CRLF`, `CR`, `LF` and `TAB` each become
@@ -57,6 +61,24 @@ label is `UNKNOWN_ENCODING`; a label that contradicts the byte evidence (for
 example a UTF-8 BOM with `encoding="ISO-8859-1"`, or `encoding="UTF-16"` in a
 document with neither BOM nor UTF-16 signature) is `INCORRECT_ENCODING`. Only
 `version="1.0"` is accepted.
+
+The resumable core makes the same decision once, from the undecided opening
+prefix. Incomplete BOMs (`EF`, `EF BB`, `FF`, `FE`), an incomplete zero-byte
+UTF-16 signature (`00`, `3C`) and an incomplete `<?xml` discriminator pause
+instead of guessing. A recognized `<?xml ` declaration is retained until `?>`
+or the scan ceiling (`min(maxInputBytes, maxTokenChars)`), then the label is
+located with the same scanner and the prefix is replayed exactly once through
+the chosen decoder. Reaching the storage ceiling is not a public error; the
+grammar reports the declaration's token budget as before. No event is emitted
+before the encoding choice that could change it.
+
+The declaration's pseudo-attribute names and values are ASCII-constrained. While
+the encoding is still undecided, a non-ASCII byte inside one of those fields is
+a certain declaration fault (`XML_DECL` with the field's own reason, reported at
+that byte), because no continuation and no encoding label can restore an ASCII
+value; it therefore wins over a later input-budget crossing. The same byte
+outside such a field is not decided early: an incomplete multibyte scalar still
+waits for its continuation or for `finish`.
 
 UTF-8 rejects invalid lead bytes, invalid continuations, overlong forms,
 surrogate values, values above `U+10FFFF`, and truncation. UTF-16 rejects an odd
@@ -89,9 +111,28 @@ the `XML_ERROR_` prefix removed.
 | `XML_DECL` | `XML_ERROR_XML_DECL` | malformed XML declaration: order, quoting, values, missing version |
 | `UNSUPPORTED_DTD` | none (local) | any `DOCTYPE`, refused before its contents are read |
 | `LIMIT_INPUT` | none (local) | raw input above the input budget |
-| `LIMIT_TOKEN` | none (local) | one name/value/text/comment/CDATA/PI accumulation above the token budget |
+| `LIMIT_TOKEN` | none (local) | one name/value/text/comment/CDATA/PI accumulation or numeric-reference digit run above the token budget |
 | `LIMIT_DEPTH` | none (local) | more open elements than the depth budget |
 | `LIMIT_ENTITY_EXPANSION` | none (local) | cumulative predefined/numeric reference output above the reference budget |
+
+The one-shot wrapper and the resumable core share one **earliest certain,
+decidable fault** rule. A permanent error is returned only when the bytes
+already consumed prove the violation for every continuation; incomplete
+signatures, multibyte scalars, references and markup delimiters pause instead
+of guessing, and a non-ASCII byte in an ASCII-constrained declaration field is
+decided at that byte before the encoding is selected. A parser fault completed
+earlier in the input wins over a later
+decoding or input-budget fault, and `finish` resolves a pending decoder fault
+before EOF-only grammar faults. The one-shot wrapper therefore reports the same
+`(code, reason)` as any chunking of the same bytes. For an input with more than
+one independent fault this can differ from a decode-everything-first order; no
+corpus outcome changes.
+
+A rejected one-shot parse returns no event array. A rejected stream may already
+have returned events, because events are irrevocable prefixes once determined;
+those prefixes are chunk-invariant and are compared with whole-input streaming,
+never with a nonexistent one-shot rejected array, and they are not a
+transactional guarantee.
 
 The trace also carries a `reason` string naming the concrete rule
 (`overlong`, `unpairedSurrogate`, `duplicateAttribute`, ...). Reasons are
@@ -149,29 +190,33 @@ can be declared.
 
 ## Future C call support
 
-The future direction is an event/consumer interface over the pure event values
-and explicit parser state, so a later adapter could implement
-`XML_ParserCreate`, handler registration, status/error codes and chunk feeding
+The resumable core is the structural foundation for a future event/consumer
+adapter. `LexPat.Stream` already separates decoding, grammar state and returned
+events, so a later adapter could implement `XML_ParserCreate`, handler
+registration, `XML_Parse`/`XML_ParseBuffer` chunk feeding and status/error codes
 without importing the CLI, JSON or reference C code into the library. Nothing of
 that exists in this milestone:
 
 * there is no exported `XML_*` symbol, no header, no shared library and no C
   entry point;
-* `parseDocument` is one-shot, so it does not have `XML_Parse`/
-  `XML_ParseBuffer` chunk semantics and must not be described as if it did;
-* a future streaming implementation must handle boundary-split BOMs, multibyte
-  characters, tokens and references explicitly;
+* `Stream.feed` accepts `ByteArray` chunks, but it is not an `XML_Parse`
+  compatibility layer: there are no callbacks, suspend/resume points, encoding
+  overrides, buffer ownership rules or C error codes;
+* `parseDocument` remains the one-shot wrapper; its rejected result still has no
+  event array, while a stream may have returned a prefix;
 * namespace processing (`XML_ParserCreateNS`) and DTD handling remain separate
   future work.
 
 The demonstration executable and the library API exist for inspection and
 differential testing of these semantics. This milestone supports no production
-integration route, `parseDocument` included.
+integration route, `LexPat.Stream` and `parseDocument` included.
 
 ## Trace stability
 
 `lexpatTrace` emits `"format":1` on every object. Field names, the sorted
 attribute rendering, event order and the terminal result shape are stable for
-that version. Changing them requires a format-version bump and corresponding
+that version. The `--chunk-size` modes print the same event objects and exactly
+one final result; they only change when an event is returned relative to the
+input. Changing the shape requires a format-version bump and corresponding
 fixture updates. That guarantee is about the trace used by the checks; it is not
 an API commitment for production use.

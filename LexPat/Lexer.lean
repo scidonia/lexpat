@@ -1,6 +1,8 @@
 /-
 XML 1.0 (Fifth Edition) character and name predicates, and the small shared
-scanners that do not need parser state.
+helpers that do not need parser state. The streaming grammar in
+`LexPat.Stream` uses these predicates for every decoded scalar; the one-shot
+entry point reaches them through the stream.
 -/
 import LexPat.Types
 
@@ -9,19 +11,6 @@ namespace LexPat
 /-- The scalar value at `pos`, if any. -/
 def natAt (chars : Array DecodedChar) (pos : Nat) : Option Nat :=
   (chars[pos]?).map (fun c => c.value.n)
-
-/-- The raw byte offset of the character at `pos` (diagnostic only). -/
-def offsetAt (chars : Array DecodedChar) (pos : Nat) : Nat :=
-  match chars[pos]? with
-  | some c => c.byteOffset
-  | none =>
-    match chars[chars.size - 1]? with
-    | some c => c.byteOffset + 1
-    | none => 0
-
-def mkError (chars : Array DecodedChar) (pos : Nat) (code : ErrorCode)
-    (reason : String) : ParseError :=
-  ⟨code, reason, offsetAt chars pos⟩
 
 /-- `lo ≤ n ∧ n ≤ hi`, as a decidable predicate over naturals. -/
 def between (n lo hi : Nat) : Bool := decide (lo ≤ n ∧ n ≤ hi)
@@ -58,15 +47,6 @@ an XML declaration. -/
 def isAsciiNameChar (n : Nat) : Bool :=
   isAsciiLetter n || isAsciiDigit n || n == 0x2E || n == 0x5F || n == 0x2D
 
-def skipWhitespace (chars : Array DecodedChar) (pos : Nat) : Nat :=
-  Id.run do
-    let mut i := pos
-    while i < chars.size do
-      match chars[i]? with
-      | some c => if isXmlWhitespace c.value.n then i := i + 1 else break
-      | none => break
-    return i
-
 /-- The scalars in `[start, stop)` as a `String`. -/
 def charsToString (chars : Array DecodedChar) (start stop : Nat) : String :=
   Id.run do
@@ -78,11 +58,6 @@ def charsToString (chars : Array DecodedChar) (start stop : Nat) : String :=
       | none => pure ()
       i := i + 1
     return String.ofList buf.toList
-
-/-- True when the scalars at `pos` are exactly `pattern`. -/
-def matchesAt (chars : Array DecodedChar) (pos : Nat) : List Nat → Bool
-  | [] => true
-  | n :: rest => (natAt chars pos == some n) && matchesAt chars (pos + 1) rest
 
 /-- Extract the `encoding` pseudo-attribute of an XML declaration, permissively.
 

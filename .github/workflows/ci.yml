@@ -21,8 +21,17 @@ jobs:
       - name: build the library and proofs
         run: nix develop -c lake build
 
+      - name: one-shot fault precedence contract
+        run: nix develop -c lake env lean --run tests/OneShotPrecedence.lean
+
       - name: build the trace executable
         run: nix develop -c lake build lexpatTrace
+
+      - name: build the raw-event driver
+        run: nix develop -c lake build lexpatEvents
+
+      - name: streaming behavior
+        run: nix develop -c python3 tests/streaming.py
 
       - name: differential against libexpat
         run: nix develop -c python3 tests/differential.py
