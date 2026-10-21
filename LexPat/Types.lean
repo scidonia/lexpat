@@ -27,8 +27,9 @@ def toChar (s : Scalar) : Char := Char.ofNat s.n
 end Scalar
 
 /-- A decoded scalar together with the byte offset of its first byte in the
-raw input. Offsets are diagnostic only; they are not part of any compatibility
-contract. -/
+raw input. The offset feeds the internal location metadata used by the
+C bridge; the public Lean event arrays expose no offsets and make
+no compatibility promise about them. -/
 structure DecodedChar where
   value : Scalar
   byteOffset : Nat
@@ -163,7 +164,9 @@ structure DecodeError where
 deriving DecidableEq, Repr
 
 /-- A parse failure: the public category, the concrete rule that failed, and
-the raw byte offset (diagnostic only). -/
+the raw byte offset of the failed token. The Lean trace treats the offset as
+diagnostic; the C bridge reports it as `XML_GetCurrentByteIndex`
+after a failure. -/
 structure ParseError where
   code : ErrorCode
   reason : String
@@ -194,5 +197,20 @@ inductive Event where
   | comment (data : String)
   | pi (target : String) (data : String)
 deriving Repr, DecidableEq, BEq
+
+/-- An `Event` together with the source coordinates recorded when the token was
+emitted. `byteOffset` is the raw byte index of the token's first byte,
+`tokenBytes` its raw byte span when the emitter knows it, `line` is 1-based,
+`column` is a 0-based scalar column, and `specifiedAttrs` is the number of
+explicit attribute pairs (nonzero only for a start event). The streaming core
+uses this for its optional event sink; the public `Event` array is unchanged. -/
+structure LocatedEvent where
+  event : Event
+  byteOffset : Nat
+  tokenBytes : Option Nat
+  line : Nat
+  column : Nat
+  specifiedAttrs : Nat
+deriving Repr
 
 end LexPat

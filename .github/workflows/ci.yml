@@ -18,11 +18,32 @@ jobs:
         with:
           extra_nix_config: "experimental-features = nix-command flakes"
 
-      - name: build the library and proofs
+      - name: build the library, proofs and C ABI artifact
         run: nix develop -c lake build
+
+      - name: clean build from shipped sources
+        run: nix develop -c bash tests/clean-build.sh
+
+      - name: C ABI contract A1
+        run: nix develop -c bash tests/c-abi-contract.sh A1
+
+      - name: C ABI contract A2
+        run: nix develop -c bash tests/c-abi-contract.sh A2
+
+      - name: C ABI differential against libexpat
+        run: nix develop -c python3 tests/c-abi-differential.py
+
+      - name: C ABI header, symbol, layout and runtime verification
+        run: nix develop -c python3 tests/c-abi-verify.py
+
+      - name: C ABI memory checks
+        run: nix develop -c bash tests/c-abi-memory.sh
 
       - name: one-shot fault precedence contract
         run: nix develop -c lake env lean --run tests/OneShotPrecedence.lean
+
+      - name: streaming API assertions
+        run: nix develop -c lake env lean --run tests/StreamingCases.lean
 
       - name: build the trace executable
         run: nix develop -c lake build lexpatTrace

@@ -11,8 +11,8 @@ package lexpat where
   fixedToolchain := true
 
 /-- The **library**: the decoder, the XML 1.0 predicates and lexer, the shared
-grammar helpers, the resumable streaming core, the one-shot wrapper and the
-decoder proofs. It imports nothing from `LexPat/Exe/`, and no C code. -/
+grammar helpers, the resumable streaming core, the one-shot wrapper, the C ABI
+bridge and the decoder proofs. It imports nothing from `LexPat/Exe/`. -/
 @[default_target] lean_lib LexPat where
   globs := #[.one `LexPat,
              .one `LexPat.Types,
@@ -21,11 +21,40 @@ decoder proofs. It imports nothing from `LexPat/Exe/`, and no C code. -/
              .one `LexPat.Lexer,
              .one `LexPat.Grammar,
              .one `LexPat.Stream,
-             .one `LexPat.Parser]
+             .one `LexPat.Parser,
+             .one `LexPat.CAbi]
 
-/- The executable is **not** a default target: a bare `lake build` is the library and
-its proofs and nothing else. `lexpatTrace` is a bounded demonstration and differential
-fixture, built on demand with `lake build lexpatTrace`. -/
+/-- The C ABI artifact: `include/expat.h` over a shared object with
+a versioned SONAME. The target collects the Lean module objects with exported
+symbols and runs the checked-in build script, which compiles the C shim and
+links both halves. Its documented subset is checked by `tests/c-abi-contract.sh`,
+`tests/c-abi-differential.py`, `tests/c-abi-verify.py` and `tests/c-abi-memory.sh`. -/
+@[default_target] target lexpatCAbi : FilePath := do
+  let pkg ← getRootPackage
+  let some lib := (← findLeanLib? `LexPat)
+    | error "lexpat: the LexPat library is missing"
+  let mods ← (← lib.modules.fetch).await
+  let objJobs ← mods.flatMapM fun mod =>
+    (mod.nativeFacets true).mapM (·.fetch mod)
+  let out := pkg.buildDir / "lib" / "liblexpat.so.1"
+  let buildScript := pkg.dir / "scripts" / "build-c-abi.sh"
+  let extraDepTrace : JobM BuildTrace := do
+    let sources := #[pkg.dir / "cabi" / "expat.c",
+                     pkg.dir / "cabi" / "exports.map",
+                     pkg.dir / "include" / "expat.h",
+                     buildScript]
+    return mixTraceArray (← sources.mapM (computeTrace ·))
+  buildFileAfterDep out (Job.collectArray objJobs "c-abi objects")
+      (extraDepTrace := extraDepTrace) fun objs => do
+    proc {
+      cmd := "bash"
+      args := #[buildScript.toString, "--out", out.toString] ++ objs.map (·.toString)
+    }
+
+/- The executable is **not** a default target: a bare `lake build` is the library,
+its proofs and the C ABI artifact. `lexpatTrace` is a bounded
+demonstration and differential fixture, built on demand with
+`lake build lexpatTrace`. -/
 lean_exe lexpatTrace where
   root := `LexPat.Exe.Trace
 

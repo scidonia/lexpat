@@ -31,6 +31,13 @@ The parser emits only determined events: a text run at the next `<` or at a
 successful EOF, a start or end tag at `>` or `/>`, a declaration, comment or
 processing instruction at its closing delimiter, and `cdataStart` at the CDATA
 opener with the CDATA text and `cdataEnd` at `]]>`.
+
+Internally each event is a `LocatedEvent` carrying the token's raw byte offset,
+its span when known, its 1-based line and 0-based scalar column, and the number
+of explicit attribute pairs. The public `feed` and `finish` map those records
+back to the unchanged `Event` arrays. `feedSink` and `finishSink` offer each
+located event at its emission point to a caller-supplied sink, which is how the
+C bridge delivers callbacks before the feeding call returns.
 -/
 import LexPat.Types
 import LexPat.Lexer
@@ -170,7 +177,6 @@ structure Stream where
   elemName : String := ""
   attrs : Array (String × String) := #[]
   attrName : String := ""
-  startNameOffset : Nat := 0
   markupOffset : Nat := 0
   markupIndex : Nat := 0
   spaced : Bool := false
@@ -189,6 +195,37 @@ structure Stream where
   /-- Raw bytes charged against the input budget, including signature bytes
   and an undecided prefix. -/
   rawConsumed : Nat := 0
+  /-- The 1-based line and 0-based scalar column of the next decoded scalar. -/
+  line : Nat := 1
+  column : Nat := 0
+  /-- Line and column of the scalar currently being processed, used to anchor
+  a markup token at its opening `<`. -/
+  charLine : Nat := 1
+  charColumn : Nat := 0
+  /-- Whether the previous decoded scalar was a raw CR; a following LF then
+  completes the same line ending. -/
+  prevRawCR : Bool := false
+  /-- Location of the `<` that opened the current markup token. -/
+  markupLine : Nat := 1
+  markupColumn : Nat := 0
+  /-- Start of the text token being accumulated; a reference marker counts as
+  its first byte when the text begins with one. -/
+  textOffset : Nat := 0
+  textLine : Nat := 1
+  textColumn : Nat := 0
+  textStarted : Bool := false
+  /-- Candidate `]]>` closing-marker start in a CDATA section, and the last
+  `]` consumed in bracket state so the candidate can advance. -/
+  cdataCloseOffset : Nat := 0
+  cdataCloseLine : Nat := 1
+  cdataCloseColumn : Nat := 0
+  lastBracketOffset : Nat := 0
+  lastBracketLine : Nat := 1
+  lastBracketColumn : Nat := 0
+  /-- The first failure's source location, once one has been recorded. -/
+  failLine : Nat := 1
+  failColumn : Nat := 0
+  failSet : Bool := false
 
 namespace Stream
 
@@ -216,7 +253,70 @@ private def failCode (s : Stream) (code : ErrorCode) (reason : String) (offset :
     Stream :=
   failedWith s ⟨code, reason, offset⟩
 
-private def pushEvents (acc : Array Event) (evs : Array Event) : Array Event :=
+/-- Record a failure at the scalar currently being processed, unless an earlier
+failure already recorded its own location. -/
+private def failHere (s : Stream) (code : ErrorCode) (reason : String)
+    (offset : Nat) : Stream :=
+  let s1 := failCode s code reason offset
+  if s1.failSet then s1
+  else { s1 with failLine := s.line, failColumn := s.column, failSet := true }
+
+/-- Record a failure at the opening markup anchor, for faults that belong to a
+whole tag, comment, declaration or CDATA section. The byte offset and the
+stored line and column all name the opening `<`, so the three getters identify
+one token opener. -/
+private def failAtMarkup (s : Stream) (code : ErrorCode) (reason : String) : Stream :=
+  let s1 := failCode s code reason s.markupOffset
+  if s1.failSet then s1
+  else { s1 with failLine := s.markupLine, failColumn := s.markupColumn, failSet := true }
+
+/-- Fill in the first failure's location from the stream cursor when no more
+specific anchor was recorded. -/
+private def noteFailure (s : Stream) : Stream :=
+  match s.status with
+  | .failed _ =>
+    if s.failSet then s
+    else { s with failLine := s.line, failColumn := s.column, failSet := true }
+  | _ => s
+
+private def noteFailure2 (p : Stream × Array LocatedEvent) :
+    Stream × Array LocatedEvent :=
+  (noteFailure p.1, p.2)
+
+/-- A located event anchored at the opening `<` of the current markup token. -/
+private def atMarkup (s : Stream) (event : Event) (pairs : Nat := 0) : LocatedEvent :=
+  { event := event
+    byteOffset := s.markupOffset
+    tokenBytes := some (s.rawConsumed - s.markupOffset)
+    line := s.markupLine
+    column := s.markupColumn
+    specifiedAttrs := pairs }
+
+/-- A located text event; its raw span is not tracked because references and
+line-ending normalization make the rendered data differ from its source. -/
+private def atText (s : Stream) (event : Event) : LocatedEvent :=
+  { event := event
+    byteOffset := s.textOffset
+    tokenBytes := none
+    line := s.textLine
+    column := s.textColumn
+    specifiedAttrs := 0 }
+
+/-- The `cdataEnd` event, anchored at the `]]>` closing marker. -/
+private def atCdataClose (s : Stream) : LocatedEvent :=
+  { event := .cdataEnd
+    byteOffset := s.cdataCloseOffset
+    tokenBytes := some (s.rawConsumed - s.cdataCloseOffset)
+    line := s.cdataCloseLine
+    column := s.cdataCloseColumn
+    specifiedAttrs := 0 }
+
+private def noteTextStart (s : Stream) (offset line column : Nat) : Stream :=
+  if s.textStarted then s
+  else { s with textOffset := offset, textLine := line, textColumn := column,
+                textStarted := true }
+
+private def pushEvents (acc : Array LocatedEvent) (evs : Array LocatedEvent) : Array LocatedEvent :=
   Id.run do
     let mut out := acc
     for e in evs do
@@ -250,12 +350,12 @@ private def chargeRefDigit (s : Stream) (digits : Nat) (offset : Nat) :
     some ⟨.limitToken, "limitToken", offset⟩
   else none
 
-private def flushText (s : Stream) (evs : Array Event) : Stream × Array Event :=
+private def flushText (s : Stream) (evs : Array LocatedEvent) : Stream × Array LocatedEvent :=
   if s.buf.isEmpty then
-    (s, evs)
+    ({ s with textStarted := false }, evs)
   else
     let text := bufferString s.buf
-    ({ s with buf := #[] }, evs.push (.text text))
+    ({ s with buf := #[], textStarted := false }, evs.push (atText s (.text text)))
 
 /-- The mode that resumes the current phase after a comment, PI or similar
 construct. -/
@@ -278,7 +378,7 @@ private def detectedEncoding (s : Stream) : Encoding :=
 
 /-! ## Start and end tags -/
 
-private def completeStartTag (s : Stream) (empty : Bool) : Stream × Array Event :=
+private def completeStartTag (s : Stream) (empty : Bool) : Stream × Array LocatedEvent :=
   let ordered := s.attrs.qsort (fun a b => a.1 < b.1)
   let duplicate := Id.run do
     let mut found := false
@@ -290,15 +390,17 @@ private def completeStartTag (s : Stream) (empty : Bool) : Stream × Array Event
       k := k + 1
     return found
   if duplicate then
-    (failCode s .duplicateAttribute "duplicateAttribute" s.startNameOffset, #[])
+    -- A duplicate attribute is a fault of the whole start tag: report the
+    -- opening `<` so the byte index and the line and column name one token.
+    (failAtMarkup s .duplicateAttribute "duplicateAttribute", #[])
   else if !empty && s.stack.size ≥ s.limits.maxDepth then
-    (failCode s .limitDepth "limitDepth" s.markupOffset, #[])
+    (failAtMarkup s .limitDepth "limitDepth", #[])
   else
     let name := s.elemName
     let attrs := s.attrs
-    let started : Array Event := #[.start name attrs]
+    let started : Array LocatedEvent := #[atMarkup s (.start name attrs) attrs.size]
     if empty then
-      let evs := started.push (.end name)
+      let evs := started.push (atMarkup s (.end name))
       let phase := if s.phase == .prolog then Phase.epilog else s.phase
       ({ s with phase := phase, mode := resumeMode phase, stack := s.stack,
                 elemName := "", attrs := #[], buf := #[], spaced := false }, evs)
@@ -307,24 +409,23 @@ private def completeStartTag (s : Stream) (empty : Bool) : Stream × Array Event
                 stack := s.stack.push name,
                 elemName := "", attrs := #[], buf := #[], spaced := false }, started)
 
-private def finishEndTag (s : Stream) (name : String) : Stream × Array Event :=
+private def finishEndTag (s : Stream) (name : String) : Stream × Array LocatedEvent :=
   match s.stack.back? with
   | some top =>
     if top == name then
       let stack := s.stack.pop
-      let evs : Array Event := #[.end name]
+      let evs : Array LocatedEvent := #[atMarkup s (.end name)]
       if stack.isEmpty then
         ({ s with stack := stack, phase := .epilog, mode := .epilogStart }, evs)
       else
         ({ s with stack := stack, mode := .contentStart }, evs)
     else
-      (failCode s .tagMismatch "tagMismatch" s.markupOffset, #[])
-  | none => (failCode s .invalidToken "strayEndTag" s.markupOffset, #[])
+      (failAtMarkup s .tagMismatch "tagMismatch", #[])
+  | none => (failAtMarkup s .invalidToken "strayEndTag", #[])
 
-private def startTagFirst (s : Stream) (c : DecodedChar) : Stream × Array Event :=
+private def startTagFirst (s : Stream) (c : DecodedChar) : Stream × Array LocatedEvent :=
   if isNameStartChar c.value.n then
-    let fresh := { s with buf := #[], startNameOffset := c.byteOffset,
-                          elemName := "", attrs := #[], spaced := false }
+    let fresh := { s with buf := #[], elemName := "", attrs := #[], spaced := false }
     match appendChar fresh c.value.toChar c.byteOffset with
     | (s1, some e) => (failedWith s1 e, #[])
     | (s1, none) => ({ s1 with mode := .startNameRest }, #[])
@@ -332,9 +433,9 @@ private def startTagFirst (s : Stream) (c : DecodedChar) : Stream × Array Event
 
 /-! ## XML declaration -/
 
-private def emitXmlDecl (s : Stream) : Stream × Array Event :=
+private def emitXmlDecl (s : Stream) : Stream × Array LocatedEvent :=
   ({ s with mode := .prologStart },
-    #[.xmlDecl "1.0" s.declEncoding s.declStandalone])
+    #[atMarkup s (.xmlDecl "1.0" s.declEncoding s.declStandalone)])
 
 private def startDeclName (s : Stream) (rest : DeclMode) (c : DecodedChar) :
     Stream × Option ParseError :=
@@ -422,7 +523,7 @@ private def doctypePat : Nat → Option Nat
 /-- Resolve a complete reference and append its character in the context that
 started it. The reference budget is charged first, matching the one-shot
 scanner's order. -/
-private def finishReference (s : Stream) (sc : Scalar) : Stream × Array Event :=
+private def finishReference (s : Stream) (sc : Scalar) : Stream × Array LocatedEvent :=
   if s.entityUsed + 1 > s.limits.maxEntityExpansion then
     (failCode s .limitEntityExpansion "limitEntityExpansion" s.refStartOffset, #[])
   else
@@ -439,8 +540,8 @@ private def finishReference (s : Stream) (sc : Scalar) : Stream × Array Event :
 
 /-- The XML declaration sub-state. `cont` re-processes the current character in
 a mode that the completed token introduces. -/
-private def declStep (cont : Stream → Stream × Array Event) (s : Stream)
-    (c : DecodedChar) (stage : DeclMode) : Stream × Array Event :=
+private def declStep (cont : Stream → Stream × Array LocatedEvent) (s : Stream)
+    (c : DecodedChar) (stage : DeclMode) : Stream × Array LocatedEvent :=
   match stage with
   | .needWs1 =>
     if isXmlWhitespace c.value.n then ({ s with mode := .decl .versionNameSkipWs }, #[])
@@ -607,7 +708,7 @@ private def declStep (cont : Stream → Stream × Array Event) (s : Stream)
 /-- One decoded character through the grammar. The fuel covers re-processing a
 delimiter in the mode it introduces; no character is processed more than a few
 times. -/
-private def runStep : Nat → Stream → DecodedChar → Stream × Array Event
+private def runStep : Nat → Stream → DecodedChar → Stream × Array LocatedEvent
   | 0, s, _ => (s, #[])
   | fuel + 1, s, c =>
     if !isActive s then (s, #[])
@@ -622,39 +723,50 @@ private def runStep : Nat → Stream → DecodedChar → Stream × Array Event
         if c.value.n == 0x0A then (s2, #[])
         else runStep fuel s2 c
     else
-      let reprocess (s1 : Stream) : Stream × Array Event := runStep fuel s1 c
+      let reprocess (s1 : Stream) : Stream × Array LocatedEvent := runStep fuel s1 c
       match s.mode with
       | .prologStart =>
         if isXmlWhitespace c.value.n then (s, #[])
         else if c.value.n == 0x3C then
           ({ s with mode := .markup, markupOffset := c.byteOffset,
+                    markupLine := s.charLine, markupColumn := s.charColumn,
                     markupIndex := s.charIndex - 1 }, #[])
         else (failCode s .invalidToken "textBeforeRoot" c.byteOffset, #[])
       | .epilogStart =>
         if isXmlWhitespace c.value.n then (s, #[])
         else if c.value.n == 0x3C then
           ({ s with mode := .markup, markupOffset := c.byteOffset,
+                    markupLine := s.charLine, markupColumn := s.charColumn,
                     markupIndex := s.charIndex - 1 }, #[])
         else (failCode s .junkAfterDocElement "textAfterRoot" c.byteOffset, #[])
       | .contentStart =>
         if c.value.n == 0x3C then
           ({ s with mode := .markup, markupOffset := c.byteOffset,
+                    markupLine := s.charLine, markupColumn := s.charColumn,
                     markupIndex := s.charIndex - 1 }, #[])
         else reprocess ({ s with mode := .text })
       | .text =>
         if c.value.n == 0x3C then
           let (s1, evs) := flushText s #[]
           ({ s1 with mode := .markup, markupOffset := c.byteOffset,
+                     markupLine := s.charLine, markupColumn := s.charColumn,
                      markupIndex := s.charIndex - 1 }, evs)
         else if c.value.n == 0x26 then
-          ({ s with mode := .refAfterAmp, refCtx := .text,
+          ({ noteTextStart s c.byteOffset s.charLine s.charColumn with
+                    mode := .refAfterAmp, refCtx := .text,
                     refStartOffset := c.byteOffset, refBuf := #[] }, #[])
         else if c.value.n == 0x5D then
-          ({ s with mode := .textBracket1 }, #[])
+          ({ noteTextStart s c.byteOffset s.charLine s.charColumn with
+                    mode := .textBracket1,
+                    lastBracketOffset := c.byteOffset,
+                    lastBracketLine := s.charLine,
+                    lastBracketColumn := s.charColumn }, #[])
         else if c.value.n == 0x0D then
-          ({ s with pendingCR := true }, #[])
+          ({ noteTextStart s c.byteOffset s.charLine s.charColumn with
+                    pendingCR := true }, #[])
         else if isXmlChar c.value.n then
-          match appendChar s c.value.toChar c.byteOffset with
+          match appendChar (noteTextStart s c.byteOffset s.charLine s.charColumn)
+              c.value.toChar c.byteOffset with
           | (s1, some e) => (failedWith s1 e, #[])
           | (s1, none) => (s1, #[])
         else (failCode s .invalidToken "illegalXmlChar" c.byteOffset, #[])
@@ -684,7 +796,7 @@ private def runStep : Nat → Stream → DecodedChar → Stream × Array Event
           if c.value.n == 0x3F then ({ s with mode := .piTarget }, #[])
           else if c.value.n == 0x21 then ({ s with mode := .bang }, #[])
           else if c.value.n == 0x2F then
-            (failCode s .invalidToken "strayEndTag" s.markupOffset, #[])
+            (failAtMarkup s .invalidToken "strayEndTag", #[])
           else startTagFirst s c
         | .content =>
           if c.value.n == 0x3F then ({ s with mode := .piTarget }, #[])
@@ -695,8 +807,8 @@ private def runStep : Nat → Stream → DecodedChar → Stream × Array Event
           if c.value.n == 0x3F then ({ s with mode := .piTarget }, #[])
           else if c.value.n == 0x21 then ({ s with mode := .bang }, #[])
           else if c.value.n == 0x2F then
-            (failCode s .invalidToken "strayEndTag" s.markupOffset, #[])
-          else (failCode s .junkAfterDocElement "junkAfterRoot" s.markupOffset, #[])
+            (failAtMarkup s .invalidToken "strayEndTag", #[])
+          else (failAtMarkup s .junkAfterDocElement "junkAfterRoot", #[])
       | .bang =>
         match s.phase with
         | .epilog =>
@@ -716,7 +828,8 @@ private def runStep : Nat → Stream → DecodedChar → Stream × Array Event
         | some expected =>
           if c.value.n == expected then
             if matched + 1 == 7 then
-              ({ s with mode := .cdata, buf := #[] }, #[.cdataStart])
+              ({ s with mode := .cdata, buf := #[], textStarted := false },
+               #[atMarkup s .cdataStart])
             else ({ s with mode := .bangCdata (matched + 1) }, #[])
           else (failedWith s (unknownMarkupError s), #[])
         | none => (failedWith s (unknownMarkupError s), #[])
@@ -725,7 +838,7 @@ private def runStep : Nat → Stream → DecodedChar → Stream × Array Event
         | some expected =>
           if c.value.n == expected then
             if matched + 1 == 7 then
-              (failCode s .unsupportedDtd "unsupportedDtd" s.markupOffset, #[])
+              (failAtMarkup s .unsupportedDtd "unsupportedDtd", #[])
             else ({ s with mode := .bangDoctype (matched + 1) }, #[])
           else (failedWith s (unknownMarkupError s), #[])
         | none => (failedWith s (unknownMarkupError s), #[])
@@ -746,34 +859,76 @@ private def runStep : Nat → Stream → DecodedChar → Stream × Array Event
       | .commentDash2 =>
         if c.value.n == 0x3E then
           let data := bufferString s.buf
-          ({ s with mode := resumeMode s.phase, buf := #[] }, #[.comment data])
+          ({ s with mode := resumeMode s.phase, buf := #[] },
+           #[atMarkup s (.comment data)])
         else (failCode s .invalidToken "doubleHyphenInComment" c.byteOffset, #[])
       | .cdata =>
-        if c.value.n == 0x5D then ({ s with mode := .cdataBracket1 }, #[])
-        else if c.value.n == 0x0D then ({ s with pendingCR := true }, #[])
+        if c.value.n == 0x5D then
+          ({ s with mode := .cdataBracket1,
+                    lastBracketOffset := c.byteOffset,
+                    lastBracketLine := s.charLine,
+                    lastBracketColumn := s.charColumn }, #[])
+        else if c.value.n == 0x0D then
+          ({ noteTextStart s c.byteOffset s.charLine s.charColumn with
+                    pendingCR := true }, #[])
         else if isXmlChar c.value.n then
-          match appendChar s c.value.toChar c.byteOffset with
+          match appendChar (noteTextStart s c.byteOffset s.charLine s.charColumn)
+              c.value.toChar c.byteOffset with
           | (s1, some e) => (failedWith s1 e, #[])
           | (s1, none) => (s1, #[])
         else (failCode s .invalidToken "illegalXmlChar" c.byteOffset, #[])
       | .cdataBracket1 =>
-        if c.value.n == 0x5D then ({ s with mode := .cdataBracket2 }, #[])
+        if c.value.n == 0x5D then
+          ({ s with mode := .cdataBracket2,
+                    cdataCloseOffset := s.lastBracketOffset,
+                    cdataCloseLine := s.lastBracketLine,
+                    cdataCloseColumn := s.lastBracketColumn,
+                    lastBracketOffset := c.byteOffset,
+                    lastBracketLine := s.charLine,
+                    lastBracketColumn := s.charColumn }, #[])
         else
-          match appendChar s ']' c.byteOffset with
+          let s0 :=
+            if s.textStarted then s
+            else { s with textOffset := s.lastBracketOffset,
+                          textLine := s.lastBracketLine,
+                          textColumn := s.lastBracketColumn,
+                          textStarted := true }
+          match appendChar s0 ']' c.byteOffset with
           | (s1, some e) => (failedWith s1 e, #[])
           | (s1, none) => reprocess ({ s1 with mode := .cdata })
       | .cdataBracket2 =>
         if c.value.n == 0x3E then
           let data := bufferString s.buf
-          let evs : Array Event :=
-            if data.isEmpty then #[.cdataEnd] else #[.text data, .cdataEnd]
-          ({ s with mode := .contentStart, buf := #[] }, evs)
+          let textEvs : Array LocatedEvent :=
+            if data.isEmpty then #[] else #[atText s (.text data)]
+          ({ s with mode := .contentStart, buf := #[], textStarted := false },
+           textEvs.push (atCdataClose s))
         else if c.value.n == 0x5D then
-          match appendChar s ']' c.byteOffset with
+          -- The candidate closing pair advances: the older bracket becomes data.
+          let s0 :=
+            if s.textStarted then s
+            else { s with textOffset := s.cdataCloseOffset,
+                          textLine := s.cdataCloseLine,
+                          textColumn := s.cdataCloseColumn,
+                          textStarted := true }
+          match appendChar s0 ']' c.byteOffset with
           | (s1, some e) => (failedWith s1 e, #[])
-          | (s1, none) => ({ s1 with mode := .cdataBracket2 }, #[])
+          | (s1, none) =>
+            ({ s1 with mode := .cdataBracket2,
+                       cdataCloseOffset := s1.lastBracketOffset,
+                       cdataCloseLine := s1.lastBracketLine,
+                       cdataCloseColumn := s1.lastBracketColumn,
+                       lastBracketOffset := c.byteOffset,
+                       lastBracketLine := s.charLine,
+                       lastBracketColumn := s.charColumn }, #[])
         else
-          match appendChar s ']' c.byteOffset with
+          let s0 :=
+            if s.textStarted then s
+            else { s with textOffset := s.cdataCloseOffset,
+                          textLine := s.cdataCloseLine,
+                          textColumn := s.cdataCloseColumn,
+                          textStarted := true }
+          match appendChar s0 ']' c.byteOffset with
           | (s1, some e) => (failedWith s1 e, #[])
           | (s1, none) =>
             match appendChar s1 ']' c.byteOffset with
@@ -874,9 +1029,9 @@ private def runStep : Nat → Stream → DecodedChar → Stream × Array Event
           if target == "xml" then
             if s.phase == .prolog && s.markupIndex == 0 then
               reprocess ({ s1 with mode := .decl .needWs1 })
-            else (failCode s1 .misplacedXmlPi "misplacedXmlDecl" s.markupOffset, #[])
+            else (failAtMarkup s1 .misplacedXmlPi "misplacedXmlDecl", #[])
           else if target.toLower == "xml" then
-            (failCode s1 .invalidToken "reservedPiTarget" s.markupOffset, #[])
+            (failAtMarkup s1 .invalidToken "reservedPiTarget", #[])
           else reprocess ({ s1 with mode := .piAfterTarget target })
       | .piAfterTarget target =>
         if c.value.n == 0x3F then ({ s with mode := .piQInit target }, #[])
@@ -887,7 +1042,7 @@ private def runStep : Nat → Stream → DecodedChar → Stream × Array Event
         else reprocess ({ s with mode := .piData target })
       | .piQInit target =>
         if c.value.n == 0x3E then
-          ({ s with mode := resumeMode s.phase }, #[.pi target ""])
+          ({ s with mode := resumeMode s.phase }, #[atMarkup s (.pi target "")])
         else (failCode s .invalidToken "piSyntax" c.byteOffset, #[])
       | .piData target =>
         if c.value.n == 0x3F then ({ s with mode := .piQ target }, #[])
@@ -900,7 +1055,8 @@ private def runStep : Nat → Stream → DecodedChar → Stream × Array Event
       | .piQ target =>
         if c.value.n == 0x3E then
           let data := bufferString s.buf
-          ({ s with mode := resumeMode s.phase, buf := #[] }, #[.pi target data])
+          ({ s with mode := resumeMode s.phase, buf := #[] },
+           #[atMarkup s (.pi target data)])
         else
           match appendChar s '?' c.byteOffset with
           | (s1, some e) => (failedWith s1 e, #[])
@@ -970,8 +1126,31 @@ private def runStep : Nat → Stream → DecodedChar → Stream × Array Event
           else (failCode s .invalidToken "unterminatedCharRef" c.byteOffset, #[])
       | .decl stage => declStep reprocess s c stage
 
-private def stepChar (s : Stream) (c : DecodedChar) : Stream × Array Event :=
-  runStep 8 { s with charIndex := s.charIndex + 1 } c
+/-- Advance the 1-based line and 0-based scalar column past one decoded scalar.
+A CR starts a new line; an LF starts one only when it does not complete a
+CRLF pair. -/
+private def advanceLoc (line column : Nat) (prevCR : Bool) (n : Nat) :
+    Nat × Nat × Bool :=
+  if n == 0x0A then
+    if prevCR then (line, 0, false) else (line + 1, 0, false)
+  else if n == 0x0D then (line + 1, 0, true)
+  else (line, column + 1, false)
+
+private def stepChar (s : Stream) (c : DecodedChar) : Stream × Array LocatedEvent :=
+  let line := s.line
+  let column := s.column
+  let (line', column', prevCR') := advanceLoc line column s.prevRawCR c.value.n
+  let s0 := { s with charIndex := s.charIndex + 1,
+                     charLine := line, charColumn := column,
+                     line := line', column := column', prevRawCR := prevCR' }
+  let (s1, evs) := runStep 8 s0 c
+  let s2 :=
+    match s1.status with
+    | .active => s1
+    | _ =>
+      if s1.failSet then s1
+      else { s1 with failLine := line, failColumn := column, failSet := true }
+  (s2, evs)
 
 /-- The encoding a declaration label selects on its own, when it names one of
 the ASCII-compatible encodings. The label's encoding is also what the pending
@@ -987,8 +1166,8 @@ private def labelEncoding (buf : Array Char) : Option Encoding :=
 
 private inductive ByteOutcome where
   | needMore (s : Stream)
-  | progressed (s : Stream) (evs : Array Event)
-  | failed (s : Stream) (evs : Array Event)
+  | progressed (s : Stream) (evs : Array LocatedEvent)
+  | failed (s : Stream) (evs : Array LocatedEvent)
 
 private def charStep (s : Stream) (c : DecodedChar) : ByteOutcome :=
   let (s1, evs) := stepChar s c
@@ -1002,13 +1181,13 @@ private def decodeUtf8Pending (s : Stream) : ByteOutcome :=
     if next == s.pending.size then
       charStep { s with pending := ByteArray.empty } ⟨sc, s.pendingOffset⟩
     else
-      .failed (failCode s .invalidToken "invalidLead" s.pendingOffset) #[]
+      .failed (failHere s .invalidToken "invalidLead" s.pendingOffset) #[]
   | .error e =>
     if e.reason == .truncated then
       .needMore s
     else
       .failed
-        (failCode s e.reason.code e.reason.name (s.pendingOffset + e.offset)) #[]
+        (failHere s e.reason.code e.reason.name (s.pendingOffset + e.offset)) #[]
 
 private def decodeUtf16Pending (s : Stream) (bigEndian : Bool) : ByteOutcome :=
   match s.pending.size with
@@ -1026,7 +1205,7 @@ private def decodeUtf16Pending (s : Stream) (bigEndian : Bool) : ByteOutcome :=
       else if u < 0xDC00 then
         .needMore s
       else
-        .failed (failCode s .invalidToken "unpairedSurrogate" s.pendingOffset) #[]
+        .failed (failHere s .invalidToken "unpairedSurrogate" s.pendingOffset) #[]
     | _, _ => .needMore s
   | 4 =>
     match decodeUtf16One s.pending bigEndian 0 with
@@ -1034,7 +1213,7 @@ private def decodeUtf16Pending (s : Stream) (bigEndian : Bool) : ByteOutcome :=
       charStep { s with pending := ByteArray.empty } ⟨sc, s.pendingOffset⟩
     | .error e =>
       .failed
-        (failCode s e.reason.code e.reason.name (s.pendingOffset + e.offset)) #[]
+        (failHere s e.reason.code e.reason.name (s.pendingOffset + e.offset)) #[]
   | _ => .needMore s
 
 private def decodeByte (s : Stream) (b : UInt8) (off : Nat) : ByteOutcome :=
@@ -1066,16 +1245,34 @@ private def decodeByte (s : Stream) (b : UInt8) (off : Nat) : ByteOutcome :=
       if h : b.toNat < 0x80 then
         charStep s ⟨⟨b.toNat, Or.inl (by omega)⟩, off⟩
       else
-        .failed (failCode s .invalidToken "invalidAscii" off) #[]
-  | _ => .failed (failCode s .syntax "decoderNotReady" off) #[]
+        .failed (failHere s .invalidToken "invalidAscii" off) #[]
+  | _ => .failed (failHere s .syntax "decoderNotReady" off) #[]
 
-private def feedDecoded (s : Stream) (evs : Array Event) (data : ByteArray)
-    (base : Nat) : Stream × Array Event :=
+/-- Offer each determined event to the sink in order and, when `collect` is
+set, append it to the returned array. The sink's `false` stops the parse: the
+C bridge reports an abort through its own terminal state, so the stream itself
+stays as it was. -/
+private def deliverEvents (collect : Bool) (sink : LocatedEvent → Bool)
+    (acc : Array LocatedEvent) (evs : Array LocatedEvent) :
+    Bool × Array LocatedEvent :=
+  Id.run do
+    let mut acc := acc
+    let mut ok := true
+    for e in evs do
+      if ok then
+        ok := sink e
+        if collect then acc := acc.push e
+    return (ok, acc)
+
+private def feedDecoded (collect : Bool) (sink : LocatedEvent → Bool)
+    (s : Stream) (evs : Array LocatedEvent) (data : ByteArray) (base : Nat) :
+    Stream × Array LocatedEvent × Bool :=
   Id.run do
     let mut st := s
     let mut acc := evs
     let mut j := 0
     let mut stop := false
+    let mut ok := true
     while !stop && j < data.size do
       if !isActive st then
         stop := true
@@ -1085,10 +1282,15 @@ private def feedDecoded (s : Stream) (evs : Array Event) (data : ByteArray)
           j := j + 1
           match decodeByte st b (base + (j - 1)) with
           | .needMore st' => st := st'
-          | .progressed st' evs' => st := st'; acc := pushEvents acc evs'
-          | .failed st' evs' => st := st'; acc := pushEvents acc evs'; stop := true
+          | .progressed st' evs' =>
+            let (ok', acc') := deliverEvents collect sink acc evs'
+            st := st'; acc := acc'; ok := ok'
+            if !ok then stop := true
+          | .failed st' evs' =>
+            let (ok', acc') := deliverEvents collect sink acc evs'
+            st := st'; acc := acc'; ok := ok'; stop := true
         | none => stop := true
-    return (st, acc)
+    return (st, acc, ok)
 
 /-! ## Encoding selection -/
 
@@ -1150,36 +1352,42 @@ private def probeAction (buf : ByteArray) : ProbeAction :=
       | none => .wait
   else .decide
 
-private def replayProbe (s : Stream) (enc : Encoding) (skip : Nat)
-    (buf : ByteArray) : Stream × Array Event :=
+private def replayProbe (collect : Bool) (sink : LocatedEvent → Bool)
+    (s : Stream) (enc : Encoding) (skip : Nat) (buf : ByteArray) :
+    Stream × Array LocatedEvent × Bool :=
   let fresh : Stream :=
     { s with enc := .decided enc, mode := .prologStart, buf := #[],
              declShadow := true, declEncoding := none, declStandalone := none,
-             declSecond := none, spaced := false }
-  feedDecoded fresh #[] (buf.extract skip buf.size) skip
+             declSecond := none, spaced := false,
+             line := 1, column := 0, prevRawCR := false,
+             textStarted := false, failSet := false }
+  feedDecoded collect sink fresh #[] (buf.extract skip buf.size) skip
 
-private def decideFromProbe (s : Stream) (buf : ByteArray) : Stream × Array Event :=
+private def decideFromProbe (collect : Bool) (sink : LocatedEvent → Bool)
+    (s : Stream) (buf : ByteArray) : Stream × Array LocatedEvent × Bool :=
   match chooseEncoding buf s.limits.maxTokenChars with
-  | .error e => (failedWith s e, #[])
-  | .ok (enc, skip) => replayProbe s enc skip buf
+  | .error e => (noteFailure (failedWith s e), #[], true)
+  | .ok (enc, skip) => replayProbe collect sink s enc skip buf
 
-/-- Feed one chunk. Events determined by this chunk are returned immediately; a
-failure in this call still returns the events determined before it. -/
-def feed (s : Stream) (chunk : ByteArray) : Stream × Array Event :=
+/-- The streaming core with an optional per-event sink. Events are offered at
+the point the grammar determines them, before later bytes of the same chunk are
+decoded. `collect` also accumulates them for the pure API. -/
+private def feedCore (collect : Bool) (sink : LocatedEvent → Bool)
+    (s : Stream) (chunk : ByteArray) : Stream × Array LocatedEvent :=
   match s.status with
   | .active =>
     if chunk.size == 0 then (s, #[])
     else
       Id.run do
         let mut st := s
-        let mut acc : Array Event := #[]
+        let mut acc : Array LocatedEvent := #[]
         let mut i := 0
         let mut stop := false
         while !stop && i < chunk.size do
           if !isActive st then
             stop := true
           else if st.rawConsumed ≥ st.limits.maxInputBytes then
-            st := failCode st .limitInput "limitInput" st.rawConsumed
+            st := failHere st .limitInput "limitInput" st.rawConsumed
             stop := true
           else
             match chunk[i]? with
@@ -1199,15 +1407,15 @@ def feed (s : Stream) (chunk : ByteArray) : Stream × Array Event :=
                   st := { st with enc := .declaration buf',
                                    mode := .decl .versionNameSkipWs }
                 | .signature enc skip =>
-                  let (st', evs') := replayProbe st enc skip buf'
+                  let (st', evs', ok) := replayProbe collect sink st enc skip buf'
                   st := st'
                   acc := pushEvents acc evs'
-                  if !isActive st then stop := true
+                  if !ok || !isActive st then stop := true
                 | .decide =>
-                  let (st', evs') := decideFromProbe st buf'
+                  let (st', evs', ok) := decideFromProbe collect sink st buf'
                   st := st'
                   acc := pushEvents acc evs'
-                  if !isActive st then stop := true
+                  if !ok || !isActive st then stop := true
               | .declaration buf =>
                 -- Drop the stream's reference to the prefix before appending, so
                 -- the append is the sole owner of the buffer and stays linear.
@@ -1254,34 +1462,55 @@ def feed (s : Stream) (chunk : ByteArray) : Stream × Array Event :=
                   stop := true
                 else if j ≥ 6 && buf'[j - 1]? == some 0x3F && b == 0x3E &&
                     j < st.limits.maxTokenChars then
-                  let (st', evs') := decideFromProbe st buf'
+                  let (st', evs', ok) := decideFromProbe collect sink st buf'
                   st := st'
                   acc := pushEvents acc evs'
-                  if !isActive st then stop := true
+                  if !ok || !isActive st then stop := true
                 else if buf'.size ≥ st.limits.maxTokenChars then
-                  let (st', evs') := decideFromProbe st buf'
+                  let (st', evs', ok) := decideFromProbe collect sink st buf'
                   st := st'
                   acc := pushEvents acc evs'
-                  if !isActive st then stop := true
+                  if !ok || !isActive st then stop := true
               | .decided _ =>
                 match decodeByte st b off with
                 | .needMore st' => st := st'
-                | .progressed st' evs' => st := st'; acc := pushEvents acc evs'
+                | .progressed st' evs' =>
+                  let (ok', acc') := deliverEvents collect sink acc evs'
+                  st := st'; acc := acc'
+                  if !ok' then stop := true
                 | .failed st' evs' =>
-                  st := st'; acc := pushEvents acc evs'; stop := true
-        return (st, acc)
+                  let (ok', acc') := deliverEvents collect sink acc evs'
+                  st := st'; acc := acc'; stop := true
+        return (noteFailure st, acc)
   | _ => (s, #[])
+
+/-- Feed one chunk. Events determined by this chunk are returned immediately; a
+failure in this call still returns the events determined before it. -/
+def feedLocated (s : Stream) (chunk : ByteArray) : Stream × Array LocatedEvent :=
+  feedCore true (fun _ => true) s chunk
+
+/-- Feed one chunk, offering each determined event to `sink` as soon as the
+grammar determines it. The returned stream is the continuation; `false` from
+the sink stops the parse. -/
+def feedSink (sink : LocatedEvent → Bool) (s : Stream) (chunk : ByteArray) :
+    Stream :=
+  (feedCore false sink s chunk).1
+
+/-- Feed one chunk and return the events it determined. -/
+def feed (s : Stream) (chunk : ByteArray) : Stream × Array Event :=
+  let (s', evs) := feedLocated s chunk
+  (s', evs.map (fun e => e.event))
 
 /-! ## Finish -/
 
 private def finishWithAppend (s : Stream) (ch : Char) (code : ErrorCode)
-    (reason : String) (evs : Array Event) : Stream × Array Event :=
+    (reason : String) (evs : Array LocatedEvent) : Stream × Array LocatedEvent :=
   match appendChar s ch s.rawConsumed with
   | (s1, some e) => (failedWith s1 e, evs)
   | (s1, none) => (failedWith s1 ⟨code, reason, s.rawConsumed⟩, evs)
 
 private def finishWithAppend2 (s : Stream) (code : ErrorCode) (reason : String)
-    (evs : Array Event) : Stream × Array Event :=
+    (evs : Array LocatedEvent) : Stream × Array LocatedEvent :=
   match appendChar s ']' s.rawConsumed with
   | (s1, some e) => (failedWith s1 e, evs)
   | (s1, none) =>
@@ -1289,9 +1518,9 @@ private def finishWithAppend2 (s : Stream) (code : ErrorCode) (reason : String)
     | (s2, some e) => (failedWith s2 e, evs)
     | (s2, none) => (failedWith s2 ⟨code, reason, s.rawConsumed⟩, evs)
 
-private def finishDecl (s : Stream) (stage : DeclMode) (evs : Array Event) :
-    Stream × Array Event :=
-  let fail (code : ErrorCode) (reason : String) : Stream × Array Event :=
+private def finishDecl (s : Stream) (stage : DeclMode) (evs : Array LocatedEvent) :
+    Stream × Array LocatedEvent :=
+  let fail (code : ErrorCode) (reason : String) : Stream × Array LocatedEvent :=
     (failCode s code reason s.rawConsumed, evs)
   match stage with
   | .needWs1 => fail .unclosedToken "unclosedXmlDecl"
@@ -1328,8 +1557,8 @@ private def finishDecl (s : Stream) (stage : DeclMode) (evs : Array Event) :
   | .thirdDone => fail .unclosedToken "unclosedXmlDecl"
   | .thirdQ => fail .xmlDecl "xmlDeclEnd"
 
-private def finishMode (s : Stream) (evs : Array Event) : Stream × Array Event :=
-  let fail (code : ErrorCode) (reason : String) : Stream × Array Event :=
+private def finishMode (s : Stream) (evs : Array LocatedEvent) : Stream × Array LocatedEvent :=
+  let fail (code : ErrorCode) (reason : String) : Stream × Array LocatedEvent :=
     (failCode s code reason s.rawConsumed, evs)
   match s.mode with
   | .prologStart => fail .noElements "noRoot"
@@ -1391,7 +1620,7 @@ private def finishMode (s : Stream) (evs : Array Event) : Stream × Array Event 
     else fail .invalidToken "unterminatedCharRef"
   | .decl stage => finishDecl s stage evs
 
-private def finishGrammar (s : Stream) (evs : Array Event) : Stream × Array Event :=
+private def finishGrammar (s : Stream) (evs : Array LocatedEvent) : Stream × Array LocatedEvent :=
   if s.pendingCR then
     let mapped : Char := match s.mode with
       | .attrValue _ => ' '
@@ -1402,11 +1631,12 @@ private def finishGrammar (s : Stream) (evs : Array Event) : Stream × Array Eve
   else
     finishMode s evs
 
-private def finishUtf16 (s : Stream) (evs : Array Event) (bigEndian : Bool) :
-    Stream × Array Event :=
+private def finishUtf16 (collect : Bool) (sink : LocatedEvent → Bool)
+    (s : Stream) (evs : Array LocatedEvent) (bigEndian : Bool) :
+    Stream × Array LocatedEvent :=
   match s.pending.size with
   | 0 => finishGrammar s evs
-  | 1 => (failCode s .partialChar "oddUtf16Length" s.pendingOffset, evs)
+  | 1 => (failHere s .partialChar "oddUtf16Length" s.pendingOffset, evs)
   | 2 =>
     match s.pending[0]?, s.pending[1]? with
     | some b0, some b1 =>
@@ -1416,16 +1646,16 @@ private def finishUtf16 (s : Stream) (evs : Array Event) (bigEndian : Bool) :
         | .ok (sc, _) =>
           let (s1, evs1) := stepChar { s with pending := ByteArray.empty }
             ⟨sc, s.pendingOffset⟩
-          match s1.status with
-          | .active => finishGrammar s1 (pushEvents evs evs1)
-          | _ => (s1, pushEvents evs evs1)
+          let (ok, acc) := deliverEvents collect sink evs evs1
+          if ok && isActive s1 then finishGrammar s1 acc else (s1, acc)
         | .error e =>
-          (failCode s e.reason.code e.reason.name (s.pendingOffset + e.offset), evs)
-      else (failCode s .invalidToken "unpairedSurrogate" s.pendingOffset, evs)
-    | _, _ => (failCode s .partialChar "oddUtf16Length" s.pendingOffset, evs)
-  | _ => (failCode s .partialChar "oddUtf16Length" s.pendingOffset, evs)
+          (failHere s e.reason.code e.reason.name (s.pendingOffset + e.offset), evs)
+      else (failHere s .invalidToken "unpairedSurrogate" s.pendingOffset, evs)
+    | _, _ => (failHere s .partialChar "oddUtf16Length" s.pendingOffset, evs)
+  | _ => (failHere s .partialChar "oddUtf16Length" s.pendingOffset, evs)
 
-private def finishDecoded (s : Stream) (evs : Array Event) : Stream × Array Event :=
+private def finishDecoded (collect : Bool) (sink : LocatedEvent → Bool)
+    (s : Stream) (evs : Array LocatedEvent) : Stream × Array LocatedEvent :=
   match s.enc with
   | .decided enc =>
     match enc with
@@ -1436,41 +1666,57 @@ private def finishDecoded (s : Stream) (evs : Array Event) : Stream × Array Eve
         | .ok (sc, _) =>
           let (s1, evs1) := stepChar { s with pending := ByteArray.empty }
             ⟨sc, s.pendingOffset⟩
-          match s1.status with
-          | .active => finishGrammar s1 (pushEvents evs evs1)
-          | _ => (s1, pushEvents evs evs1)
+          let (ok, acc) := deliverEvents collect sink evs evs1
+          if ok && isActive s1 then finishGrammar s1 acc else (s1, acc)
         | .error e =>
-          (failCode s e.reason.code e.reason.name (s.pendingOffset + e.offset), evs)
-    | .utf16le => finishUtf16 s evs false
-    | .utf16be => finishUtf16 s evs true
+          (failHere s e.reason.code e.reason.name (s.pendingOffset + e.offset), evs)
+    | .utf16le => finishUtf16 collect sink s evs false
+    | .utf16be => finishUtf16 collect sink s evs true
     | .latin1 => finishGrammar s evs
     | .ascii => finishGrammar s evs
   | _ => finishGrammar s evs
 
-/-- Finish the document. A pending decoder fault is resolved before EOF-only
-grammar faults. A completed or failed stream is inert. -/
-def finish (s : Stream) : Stream × Array Event :=
+private def finishCore (collect : Bool) (sink : LocatedEvent → Bool)
+    (s : Stream) : Stream × Array LocatedEvent :=
   match s.status with
   | .active =>
     match s.enc with
     | .probing buf =>
       match chooseEncoding buf s.limits.maxTokenChars with
-      | .error e => (failedWith s e, #[])
+      | .error e => (noteFailure (failedWith s e), #[])
       | .ok (enc, skip) =>
-        let (s1, evs) := replayProbe s enc skip buf
-        match s1.status with
-        | .active => finishDecoded s1 evs
-        | _ => (s1, evs)
+        let (s1, evs, ok) := replayProbe collect sink s enc skip buf
+        if !ok then (noteFailure s1, evs)
+        else
+          match s1.status with
+          | .active => noteFailure2 (finishDecoded collect sink s1 evs)
+          | _ => (noteFailure s1, evs)
     | .declaration buf =>
       match chooseEncoding buf s.limits.maxTokenChars with
-      | .error e => (failedWith s e, #[])
+      | .error e => (noteFailure (failedWith s e), #[])
       | .ok (enc, skip) =>
-        let (s1, evs) := replayProbe s enc skip buf
-        match s1.status with
-        | .active => finishDecoded s1 evs
-        | _ => (s1, evs)
-    | .decided _ => finishDecoded s #[]
+        let (s1, evs, ok) := replayProbe collect sink s enc skip buf
+        if !ok then (noteFailure s1, evs)
+        else
+          match s1.status with
+          | .active => noteFailure2 (finishDecoded collect sink s1 evs)
+          | _ => (noteFailure s1, evs)
+    | .decided _ => noteFailure2 (finishDecoded collect sink s #[])
   | _ => (s, #[])
+
+/-- Finish the document. A pending decoder fault is resolved before EOF-only
+grammar faults. A completed or failed stream is inert. -/
+def finishLocated (s : Stream) : Stream × Array LocatedEvent :=
+  finishCore true (fun _ => true) s
+
+/-- Finish the document, offering each determined event to `sink`. -/
+def finishSink (sink : LocatedEvent → Bool) (s : Stream) : Stream :=
+  (finishCore false sink s).1
+
+/-- Finish the document and return the events it determined. -/
+def finish (s : Stream) : Stream × Array Event :=
+  let (s', evs) := finishLocated s
+  (s', evs.map (fun e => e.event))
 
 end Stream
 

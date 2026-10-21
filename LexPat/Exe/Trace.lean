@@ -13,9 +13,11 @@ chunk-boundary invariance. A rejected stream may already have printed prefix
 events; the one-shot mode cannot.
 
 This executable is a demonstration and differential fixture, not a production
-integration route, and neither is any other surface in this milestone:
-`LexPat.parseDocument` and `LexPat.Stream` exist for inspection and later
-design, not as supported integration routes.
+integration route. `LexPat.parseDocument` and `LexPat.Stream` exist for
+inspection and later design, not as supported integration routes. The separate
+C ABI artifact (`include/expat.h` and `liblexpat.so.1`) is a verified integration
+route for its documented `XML_*` subset; this executable does not use it and
+defines no C entry point.
 -/
 
 namespace LexPat.Trace
@@ -137,7 +139,8 @@ def help : String :=
     "\n" ++
     "not supported (rejected, never simulated):\n" ++
     "  DOCTYPE and any DTD, non-predefined named entities, external entities,\n" ++
-    "  namespace URI processing, other encodings, XML 1.1 and the C API.\n" ++
+    "  namespace URI processing, other encodings, XML 1.1 and C calls outside\n" ++
+    "  the documented include/expat.h subset.\n" ++
     "\n" ++
     "This executable is a demonstration and differential fixture, not a\n" ++
     "supported production integration route.\n"

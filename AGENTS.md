@@ -8,7 +8,7 @@ this repository's behavior, not how any particular change was produced.
 All Lean and C toolchain commands run through the pinned dev shell:
 
 ```sh
-nix develop -c lake build                      # library and proofs only
+nix develop -c lake build                      # library, proofs and the C ABI artifact
 nix develop -c lake build lexpatTrace          # the demonstration executable
 nix develop -c lake build lexpatEvents         # raw-event attribute-order driver
 nix develop -c lake env lean --run tests/OneShotPrecedence.lean
@@ -16,6 +16,11 @@ nix develop -c lake env lean --run tests/StreamingCases.lean
 nix develop -c lake exe lexpatTrace tests/corpus/basic.xml
 nix develop -c lake exe lexpatTrace --chunk-size 1 tests/corpus/basic.xml
 nix develop -c bash tests/clean-build.sh
+nix develop -c bash tests/c-abi-contract.sh A1
+nix develop -c bash tests/c-abi-contract.sh A2
+nix develop -c python3 tests/c-abi-differential.py
+nix develop -c python3 tests/c-abi-verify.py
+nix develop -c bash tests/c-abi-memory.sh
 nix develop -c python3 tests/streaming.py
 nix develop -c python3 tests/differential.py
 nix develop -c python3 tests/differential.py --group limits
@@ -23,11 +28,13 @@ nix develop -c bash tests/no-admits.sh
 nix develop -c lake env lean LexPat/Encoding/Proofs.lean
 ```
 
-`lake build` builds the default library and excludes `LexPat/Exe`; the
-executable is deliberately not a default target. `.github/workflows/ci.yml` runs
-the library build, the one-shot contract, the executable build, the streaming
-harness, the full differential, the `limits` group, the admit check and the
-proof audit, in that order, after installing Nix with flakes enabled.
+`lake build` builds the default library, the proofs and the C ABI artifact;
+`LexPat/Exe` is excluded and the executable is deliberately not a default
+target. `.github/workflows/ci.yml` runs the library build, the clean build, the
+two C ABI contracts, the C differential, the artifact verification, the memory
+checks, the one-shot contract, the streaming checks, the full differential, the
+`limits` group, the admit check and the proof audit, in that order, after
+installing Nix with flakes enabled.
 
 A git-backed flake evaluates the **staged** tree. Stage new or changed flake
 inputs (`flake.nix`, `flake.lock`, `lean-toolchain`, `lakefile.lean`,
@@ -63,8 +70,9 @@ with `cc -std=c11 -Wall -Wextra -Werror tests/reference.c -lexpat`, falling back
 to `pkg-config --cflags --libs expat` and reporting that deviation. It registers
 only the XML declaration, start/end, character data, CDATA, comment and PI
 handlers, sets `XML_PARAM_ENTITY_PARSING_NEVER`, installs no external resolver
-and never reads a system identifier. libexpat is a test oracle only; no C code is
-linked into the Lean library or executable.
+and never reads a system identifier. libexpat is a test oracle only; neither the
+Lean library, its executable nor the C ABI artifact links system
+libexpat.
 
 ## Streaming boundary
 
@@ -131,6 +139,79 @@ guarantee. Stored state is inspected structurally in `StreamingCases.lean`:
 pending decoder bytes are at most three, unfinished values are bounded by
 `maxTokenChars`, and no field retains a consumed chunk. Address space is not
 used as a proxy for resident bytes.
+
+## C ABI boundary
+
+`include/expat.h` over `liblexpat.so.1` is the bounded C surface;
+`docs/compatibility.md` names every supported and refused call, the numeric
+error mapping, the buffer rules and the callback positions. The C route is
+verified only for that subset and only on x86_64-linux with the pinned Lean
+runtime; byte-identical output, Expat's private struct layout and symbols the
+header does not declare are not claimed.
+
+`tests/c-abi-contract.sh` runs the C-boundary scenarios in
+`tests/c-abi-contract.md` against the shipped header and shared object, one
+scenario per process. A1 binds the `XML_Parse` status and the ordered
+start/end records to that call; A2 binds the poisoned parser's refusal and its
+zero callbacks to the same detector that observes the unpoisoned control. Each
+scenario was observed failing at its own assertion when its handler dispatch was
+removed from an isolated copy of the implementation, with the other scenario and
+the one-shot contract unchanged. A scenario that passes without its behavior is
+vacuous and does not count as evidence.
+
+`tests/c-abi-client.c` is one source compiled twice by
+`tests/c-abi-differential.py`: against the candidate header and shared object,
+and against the dev shell's Expat header and library. It calls only the subset
+both provide, and no `#ifdef` selects a different parser. The harness
+materialises every `tests/corpus/cases.json` input in
+`TemporaryDirectory(prefix="lexpat-cabi-", dir="/tmp")`, runs both clients under
+whole, single-byte, `fixed:7` and one seeded partition per case, and again
+through `XML_GetBuffer`/`XML_ParseBuffer`. Accepted documents compare event
+order, payloads and ordered attribute pairs, coalescing adjacent text only (never
+across a CDATA boundary) because the implementations split characters and text
+runs differently. Rejected documents compare accept/reject and the numeric code
+for the codes both headers define. The fixture outcome is asserted on each side
+independently, every manifest `exception` row must still differ, and an
+exception that stops differing fails. Negative controls mutate an event name,
+flip an accept flag, make an exception row stop differing, and prove the
+side-to-side comparator observes a changed name. A prefix-timing case states the
+candidate's per-token callback counts and the system Expat's deferral as separate
+expectations; a changed expectation fails the same comparator.
+
+Callback positions are asserted against tables authored from the input bytes in
+`tests/c-abi-differential.py` and in `tests/c-abi-verify.py`, not read from either
+parser. The candidate's documented differences are the empty-element end anchor
+(the opener, where Expat reports the position after the tag) and BOM columns
+(not counted by the candidate); they are stated per case. A representative case
+is also compared across all partitions to show that chunk cuts do not change the
+records or positions.
+
+`tests/c-abi-verify.py` runs one group per criterion: source compatibility and
+refused build modes, the pinned `XML_GetUserData` macro over the candidate
+library, the exact `XML_*` export allowlist against the header (with an
+affirmative symbol control, a mutation control and an absent Expat extension
+control), SONAME/NEEDED/RUNPATH plus a real loader launch, public enumerator values,
+struct layout and callback typedef signature equality with the pinned header
+(with mutation controls), truthful version, version info and feature list,
+lifecycle and registry-checked released handles, buffer reservations and
+refusals, exact error codes and stable strings, callback positions, every
+declared unsupported family, malformed event frames and NULL/invalid-length,
+re-entrant and free-in-callback behavior. The malformed-frame group links the C
+shim and the Lean module objects into a test executable and injects fabricated
+version-1 frames through the same receiver the Lean producer calls; it is a test
+target, not an exported bypass. Nothing tests a fabricated non-NULL address or
+calls `XML_GetUserData` after a free.
+
+`tests/c-abi-memory.sh` runs the same client cases under an ASan/UBSan-instrumented
+shim and client, then runs the unsanitized client against the shipped shared
+object under Valgrind with definite leaks treated as errors. ASan covers only
+instrumented C code and its interceptors, not the prebuilt Lean runtime, and its
+leak detection is off because this artifact has no runtime-finalize step.
+Valgrind covers the whole process including the pinned Lean runtime, but only for
+the executed paths; a `possibly lost` block at exit and still-reachable runtime
+state are visible in its log rather than suppressed. Neither detector proves
+memory safety for every input, and neither is evidence about resident memory.
+`tests/c-abi-smoke.sh` is the capability smoke, not the contract.
 
 ## Corpus
 
@@ -223,17 +304,18 @@ accident.
 
 ## Documentation claims
 
-`lexpatTrace` is a bounded demonstration and differential fixture. No surface in
-this milestone is a production integration route: not the executable, not
-`LexPat.parseDocument`, not `LexPat.Stream`, and not any C entry point or other
-library call. The library API is documented so its behavior can be inspected
-and so a later design has something concrete to build on, not as a supported
-route. The event-trace claims above hold only because the differential compares
-the Lean events with the fixtures on every accepted row, and the streaming
-claims hold only because `tests/streaming.py` compares every partition with
-independently declared expected events and with the one-shot result. Changes to
-the demonstrated subset, the trace fields, the chunked modes or the limits must
-update `README.md`, `docs/compatibility.md` and the shipped JSONL fixtures
-together. The one-shot wrapper and the stream share
-one earliest-certain-fault rule; a page must not describe the old
-decode-everything-first priority as current.
+`lexpatTrace` is a bounded demonstration and differential fixture. The M1/M2
+surfaces are not production integration routes: not the executable, not
+`LexPat.parseDocument`, not `LexPat.Stream`. The bounded C subset in
+`include/expat.h` is separately verified as described above and is the only
+advertised C integration route; a change to its header, exported set, public
+layouts, error, buffer or location semantics, or its documentation must update
+`tests/c-abi-verify.py` and `docs/compatibility.md` together. The event-trace
+claims above hold only because the differential compares the Lean events with the
+fixtures on every accepted row, and the streaming claims hold only because
+`tests/streaming.py` compares every partition with independently declared
+expected events and with the one-shot result. Changes to the demonstrated
+subset, the trace fields, the chunked modes or the limits must update
+`README.md`, `docs/compatibility.md` and the shipped JSONL fixtures together.
+The one-shot wrapper and the stream share one earliest-certain-fault rule; a page
+must not describe the old decode-everything-first priority as current.

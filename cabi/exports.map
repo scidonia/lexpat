@@ -1,0 +1,10 @@
+/* The public dynamic surface is exactly the XML_* manifest. The Lean bridge
+   exports, module initialiser and the frame receiver stay local to the shared
+   object, so a client cannot reach them even though the linker resolves them
+   internally. */
+{
+  global:
+    XML_*;
+  local:
+    *;
+};

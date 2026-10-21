@@ -6,11 +6,25 @@ C-internal: the parser reproduces XML 1.0 (Fifth Edition) document semantics
 and Expat's event and error categories, while normalizing details such as error
 text, byte offsets and callback chunk boundaries.
 
-This is the second milestone: a pure, total, resumable parser core with a
-one-shot wrapper, a demonstration executable with a versioned trace and
-chunked feeding modes, a checked-in corpus compared against a local libexpat
-build, direct streaming assertions, and machine-checked properties of the
-UTF-8 decoder.
+The library is a pure, total, resumable parser core with a one-shot wrapper, a
+demonstration executable with a versioned trace and chunked feeding modes, a
+checked-in corpus compared against a local libexpat build, direct streaming
+assertions, and machine-checked properties of the UTF-8 decoder. The repository
+also builds `include/expat.h` and `liblexpat.so.1` for a bounded `XML_*` call
+surface; that artifact's C-boundary contract, differential, ABI and memory
+checks are part of the check list below. The Lean library and the trace
+semantics are unchanged by it.
+
+For x86_64-linux with the pinned Lean runtime, `include/expat.h` and
+`liblexpat.so.1` provide the XML_* subset listed below as the verified C
+integration route; unsupported calls fail closed as documented. This is not a
+drop-in replacement for libexpat outside that subset. The tested compile recipe
+is `tests/c-abi-client.c`, built and run against both this library and the dev
+shell's libexpat by:
+
+```sh
+nix develop -c python3 tests/c-abi-differential.py
+```
 
 ## Build and check
 
@@ -25,6 +39,11 @@ nix develop -c lake env lean --run tests/StreamingCases.lean
 nix develop -c lake exe lexpatTrace tests/corpus/basic.xml
 nix develop -c lake exe lexpatTrace --chunk-size 1 tests/corpus/basic.xml
 nix develop -c bash tests/clean-build.sh
+nix develop -c bash tests/c-abi-contract.sh A1
+nix develop -c bash tests/c-abi-contract.sh A2
+nix develop -c python3 tests/c-abi-differential.py
+nix develop -c python3 tests/c-abi-verify.py
+nix develop -c bash tests/c-abi-memory.sh
 nix develop -c python3 tests/streaming.py
 nix develop -c python3 tests/differential.py
 nix develop -c python3 tests/differential.py --group limits
@@ -32,9 +51,53 @@ nix develop -c bash tests/no-admits.sh
 nix develop -c lake env lean LexPat/Encoding/Proofs.lean
 ```
 
-`lake build` builds only the library and its proofs; the executable is built on
-demand, so a bare build needs nothing outside the Lean toolchain. The
-differential needs a C compiler and libexpat from the dev shell.
+`lake build` builds the library, its proofs and the C ABI artifact; the
+executable is built on demand. A bare build needs nothing outside the Lean
+toolchain, and the C artifact's runtime dependency on the pinned Lean runtime is
+recorded as an `libleanshared.so` `NEEDED` entry. The differential needs a C
+compiler and libexpat from the dev shell; the memory check needs Valgrind from
+the same shell.
+
+The C ABI contract, differential, artifact verification and memory checks cover
+only the bounded `XML_*` surface below. `tests/c-abi-verify.py` also checks that
+the header, the exported symbol set, the public layouts and the loader fields
+match what is documented here; `docs/compatibility.md` lists every unsupported
+family and the error mapping.
+
+## C ABI call surface
+
+Supported calls, all on a parser returned by `XML_ParserCreate(NULL)`:
+
+* lifecycle and data: `XML_ParserFree`, `XML_SetUserData`, the pinned
+  `XML_GetUserData` macro;
+* handlers: `XML_SetElementHandler`, `XML_SetStartElementHandler`,
+  `XML_SetEndElementHandler`, `XML_SetCharacterDataHandler`,
+  `XML_SetProcessingInstructionHandler`, `XML_SetCommentHandler`,
+  `XML_SetCdataSectionHandler`, `XML_SetStartCdataSectionHandler`,
+  `XML_SetEndCdataSectionHandler`, `XML_SetXmlDeclHandler`;
+* parse and buffer: `XML_Parse`, `XML_GetBuffer`, `XML_ParseBuffer`, with
+  `XML_STATUS_OK` or `XML_STATUS_ERROR` only;
+* error and location: `XML_GetErrorCode`, `XML_ErrorString`,
+  `XML_GetCurrentByteIndex`, `XML_GetCurrentLineNumber`,
+  `XML_GetCurrentColumnNumber`;
+* identity and status: `XML_ExpatVersion`, `XML_ExpatVersionInfo`,
+  `XML_GetFeatureList`, `XML_SetParamEntityParsing` with
+  `XML_PARAM_ENTITY_PARSING_NEVER` only, `XML_GetParsingStatus`,
+  `XML_GetSpecifiedAttributeCount`, `XML_GetIdAttributeIndex`.
+
+Everything else declared in `include/expat.h` refuses deterministically:
+creators return `NULL`, setters return failure, enabling an unsupported handler
+poisons the parser with `XML_ERROR_UNSUPPORTED_FEATURE`, and no resolver, file
+or network path exists. Namespace processing, DTDs, external entities, unknown
+encodings and suspend/resume are not implemented. The version string and
+feature list describe this library (`lexpat_0.1.0-cabi1`), not Expat.
+
+The caller must pass a live handle from this library and accessible memory for
+every non-NULL pointer and declared length. `XML_GetUserData` dereferences the
+handle directly and is undefined after `XML_ParserFree`; an old pointer whose
+address was reused for a different parser cannot be distinguished from that new
+parser. These limits and the exact error, buffer and location semantics are in
+`docs/compatibility.md`.
 
 ## Library
 
@@ -72,11 +135,10 @@ wrapper shares the stream's rule, it reports the earliest certain fault in
 input order. For an input with more than one independent fault this can differ
 from a decode-everything-first order; every corpus outcome is unchanged.
 
-This milestone supports no production integration surface, `Stream` and
-`parseDocument` included. The library API is documented so its behavior can be
-inspected and so a later design has something concrete to build on; it is not a
-supported integration route, and no compatibility or stability commitment
-attaches to it.
+The Lean library API, `Stream` and `parseDocument` included, is not a supported
+integration route. It is documented so its behavior can be inspected and so a
+later design has something concrete to build on; no compatibility or stability
+commitment attaches to it.
 
 Encoding validation and XML character legality are deliberately separate:
 UTF-8, UTF-16, ISO-8859-1 and US-ASCII decide which *scalars* exist, while
@@ -86,8 +148,9 @@ use.
 ## Demonstration executable
 
 `lexpatTrace` is a bounded demonstration and differential fixture. It is **not**
-a production integration route, and it does not provide, promise or emulate a C
-API. Its documented surface is its input syntax and its stable trace shape.
+a production integration route and it is not a C API; the C ABI artifact
+described above is the separate, bounded C route and this executable does not
+call it. Its documented surface is its input syntax and its stable trace shape.
 
 ```sh
 nix develop -c lake exe lexpatTrace tests/corpus/basic.xml
@@ -202,17 +265,22 @@ unbounded-recursion and entity-amplification failure modes.
 
 These are rejected, not simulated or silently skipped:
 
-* the C ABI (any exported `XML_*` function), byte-identical output, exact error
-  text or offsets, and callback chunk boundaries;
+* every C call outside the bounded `XML_*` subset in `include/expat.h`:
+  namespace processing, DTDs, external entities, unknown encodings,
+  suspend/resume and all symbols the header does not declare fail closed, and
+  byte-identical output, exact error text or offsets and callback chunk
+  boundaries are not claimed;
 * every `DOCTYPE`, internal or external DTD subsets, parameter entities,
   non-predefined general entities, external entity resolution, catalogs, and
   system identifiers (no resolver exists and no identifier is read);
 * namespace URI processing and namespace-aware name splitting (raw qualified
   names are reported instead);
 * XML 1.1, unknown encodings, and encodings other than the four above;
-* any production integration or stability promise: `Stream`, `parseDocument`
-  and `lexpatTrace` are inspection and demonstration surfaces, and the chunked
-  modes do not emulate `XML_Parse`/`XML_ParseBuffer` semantics.
+* any production integration or stability promise for `Stream`,
+  `parseDocument` or `lexpatTrace`, which remain inspection and demonstration
+  surfaces; the trace's chunked modes are not an emulation of the C
+  `XML_Parse`/`XML_ParseBuffer` entry points. The bounded C subset is the
+  separately verified route described above.
 
 ## Proved decoder properties
 
@@ -245,6 +313,22 @@ failure. Three negative controls run through the Lean comparison: an unmutated
 trace must match, a mutated event field must be detected, and a flipped accept
 decision must be detected in both directions. See `docs/compatibility.md` for
 the mapping and the enumerated differences, and `AGENTS.md` for the test policy.
+
+`tests/c-abi-contract.sh` runs the two C-boundary scenarios in
+`tests/c-abi-contract.md` against the shipped header and shared object.
+`tests/c-abi-differential.py` compiles `tests/c-abi-client.c` twice — once
+against `include/expat.h` and `liblexpat.so.1`, once against the dev shell's
+libexpat — and runs both over `tests/corpus/cases.json` under whole, single-byte,
+fixed and seeded partitions and through the buffer entry points. It compares
+event order, payloads, attribute order and common numeric error codes, asserts
+each side against its own fixture expectation, and declares every remaining
+difference. `tests/c-abi-verify.py` checks source compatibility, the exact
+exported symbol set, SONAME/NEEDED/RUNPATH and a real loader launch, public layout and
+callback-signature equality with the pinned header, truthful version and feature
+identity, lifecycle, buffer, error, location,
+malformed-wire, fail-closed and NULL/invalid-length behavior.
+`tests/c-abi-memory.sh` runs an ASan/UBSan-instrumented shim and client and a
+Valgrind release client over those paths, and prints the detector limits.
 
 `tests/streaming.py` is the separate streaming check. It runs
 `tests/StreamingCases.lean` for direct API assertions, then every corpus case

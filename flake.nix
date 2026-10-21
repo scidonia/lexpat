@@ -55,9 +55,10 @@
           };
 
           # The dev shell carries the Lean toolchain, a C compiler and `libexpat`'s
-          # headers and library for the reference oracle, and Python for the
-          # differential harness. `expat` is a test oracle only: no C code is
-          # linked into the Lean library or its executable.
+          # headers and library for the reference oracle, Python for the
+          # differential harness, and Valgrind for the release C memory check.
+          # `expat` is a test oracle only: neither the Lean library, its
+          # executable nor the C ABI artifact links system libexpat.
           lexpatShell = pkgs.mkShell {
             name = "lexpat";
 
@@ -69,6 +70,7 @@
               pkgs.stdenv.cc
               pkgs.pkg-config
               pkgs.python3
+              pkgs.valgrind
               config.treefmt.build.wrapper
             ];
 
