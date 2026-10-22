@@ -244,7 +244,9 @@ unbounded-recursion and entity-amplification failure modes.
 CVE-class disposition table, allocation-failure behavior, pointer and handle
 lifetime, and the limits of fuzzing and sanitizer evidence. The only verified
 integration route is the bounded C ABI, and it is not a drop-in replacement for
-libexpat outside that subset.
+libexpat outside that subset. `docs/security-hardening.md` is the work record:
+the defects found and fixed, the evidence added, and the libexpat features that
+remain absent.
 
 A C-shim allocation failure during a callback now makes the same `XML_Parse`
 call return `XML_STATUS_ERROR` with `XML_GetErrorCode` equal to

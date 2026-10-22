@@ -3,7 +3,9 @@
 This page describes the security-relevant surface of the bounded C ABI
 artifact, the checks that exercise it, and the limits of that evidence. It is a
 technical threat model, not a disclosure policy, and it does not claim that the
-parser is free of bugs.
+parser is free of bugs. The findings and fixes, the evidence added, and the
+libexpat features that remain absent are recorded in
+[`docs/security-hardening.md`](security-hardening.md).
 
 ## Supported route
 
