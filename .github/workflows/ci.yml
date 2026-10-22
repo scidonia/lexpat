@@ -50,10 +50,11 @@ jobs:
             2>&1 | tee "$RUNNER_TEMP/lexpat-fuzz-build/build.log"
 
       # One step covers CVE checks, the fixed differential replay, injected
-      # shim OOM, the benchmark smoke and the four-target fuzz smoke. The
-      # wrapper runs outside Nix, so its 300-second deadline includes Nix
-      # startup, and it kills and reaps the whole process group on timeout.
-      # Each stage keeps its own log under the stages directory.
+      # shim OOM and the four-target fuzz smoke; the scaling sentinel is its
+      # own required step below. The wrapper runs outside Nix, so its
+      # 300-second deadline includes Nix startup, and it kills and reaps the
+      # whole process group on timeout. Each stage keeps its own log under the
+      # stages directory.
       - name: bounded security checks
         run: |
           mkdir -p "$RUNNER_TEMP/lexpat-security"
@@ -64,8 +65,21 @@ jobs:
                  --out "$RUNNER_TEMP/lexpat-security/stages" \
                  --build-dir "$RUNNER_TEMP/lexpat-fuzz-build"
 
-      # Reached when preparation or the security step fails. The preparation
-      # log is required; the wrapper log exists once the bounded step started.
+      # Scaling is a timing measurement with its own classification, so it runs
+      # as its own required step instead of inside the bounded security budget.
+      # The helper retries one drift-inconclusive session and nothing else; a
+      # second inconclusive attempt fails the step rather than calling a failed
+      # measurement a pass.
+      - name: scaling sentinel
+        timeout-minutes: 10
+        run: |
+          bash tests/security-scaling-ci.sh \
+            --out "$RUNNER_TEMP/lexpat-scaling"
+
+      # Reached when preparation, the security step or the scaling step fails.
+      # The preparation log is required; the wrapper and scaling logs exist once
+      # their steps started, and each scaling attempt keeps its own log, CSV,
+      # report and drift signal.
       - name: upload security diagnostics
         if: failure()
         uses: actions/upload-artifact@v4
@@ -79,6 +93,10 @@ jobs:
             ${{ runner.temp }}/lexpat-fuzz-build/targets.sha256
             ${{ runner.temp }}/lexpat-security/bounded.log
             ${{ runner.temp }}/lexpat-security/stages/**/*.log
+            ${{ runner.temp }}/lexpat-scaling/attempt*.log
+            ${{ runner.temp }}/lexpat-scaling/attempt-*/candidate.csv
+            ${{ runner.temp }}/lexpat-scaling/attempt-*/report.txt
+            ${{ runner.temp }}/lexpat-scaling/attempt-*/drift-inconclusive.signal
 
       - name: C ABI differential against libexpat
         run: nix develop -c python3 tests/c-abi-differential.py

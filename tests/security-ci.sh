@@ -1,8 +1,14 @@
 #!/usr/bin/env bash
 # The bounded security step: CVE checks, fixed differential replay, injected
-# shim OOM, benchmark smoke and the four-target libFuzzer smoke.
+# shim OOM and the four-target libFuzzer smoke.
 #
 #   tests/security-ci.sh --out <absolute-directory> [--build-dir <absolute-directory>]
+#
+# The scaling sentinel is deliberately not a stage here: it is a timing
+# measurement, and its drift control classifies an unusable session rather than
+# a security failure. `.github/workflows/ci.yml` runs it as its own required
+# step through `tests/security-scaling-ci.sh`, which owns the one classified
+# retry. Everything this script runs is either a pass or a failure.
 #
 # With `--build-dir`, the prepared build is verified against its own content
 # manifests before any runtime check: a missing, stale or mismatched build is
@@ -141,8 +147,6 @@ stage fixed-differential bash "$repo/tests/security-differential-fixed.sh" \
   --out "$out/diff-fixed"
 stage oom-sanitized bash "$repo/tests/security-oom-sanitized.sh" \
   --out "$out/oom-sanitized"
-stage benchmark-ci bash "$repo/tests/security-benchmark.sh" --suite ci \
-  --out "$out/benchmark-ci"
 stage fuzz-smoke bash "$repo/tests/security-fuzz-smoke.sh" \
   --out "$out/fuzz-smoke" --build-dir "$build_dir"
 

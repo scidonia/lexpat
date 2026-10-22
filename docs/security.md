@@ -161,7 +161,11 @@ Limits of that evidence:
   its own forked child, so the recorded `rss_kb` is that entry's `wait4`
   resident peak rather than a process-lifetime high-water mark. Machine, CPU
   model, core count, governor and load average are recorded with the
-  pinned-CPU note.
+  pinned-CPU note. The hosted sentinel uses the broader 3.5 doubling bound and
+  its own 15% drift control; a sentinel pass is not a paired result, and the
+  local pair's 2.75 and 1.25 bounds are not hosted evidence. A drift shift
+  above 15% makes that session inconclusive, so the CI helper retries it at
+  most once; an inconclusive session is neither a regression nor a pass.
 * The CVE set asserts the listed local outcomes and, where safe, the pinned
   reference outcome. A refusal of an absent feature demonstrates only that
   boundary, not a fix for an upstream Expat vulnerability in code this project
@@ -185,11 +189,23 @@ nix develop -c bash tests/security-oom-sanitized.sh --out /tmp/lexpat-oom
 nix develop -c python3 tests/security-cve.py
 nix develop -c bash tests/security-differential-fixed.sh --out /tmp/lexpat-diff
 nix develop -c bash tests/security-benchmark.sh --suite ci --out /tmp/lexpat-bench
+bash tests/security-scaling-ci.sh --out /tmp/lexpat-scaling
 nix develop -c bash tests/security-fuzz-smoke.sh --out /tmp/lexpat-fuzz
 ```
 
-`tests/security-ci.sh` runs the CVE, fixed differential, injected sanitizer,
-benchmark and fuzz-smoke stages in that order; CI applies one 300-second outer
-cap to the whole command. Long campaigns are run separately with
-`tests/security-fuzz-campaign.sh` and write only under an external `--out`
-directory.
+`tests/security-ci.sh` runs the CVE, fixed differential, injected sanitizer and
+fuzz-smoke stages in that order; CI applies one 300-second outer cap to the
+whole command. The scaling sentinel is a separate required step, because the
+drift control classifies a measurement session rather than a security failure.
+`tests/security-scaling-ci.sh` runs
+`tests/security-benchmark.sh --suite ci`, requires an `--out` that does not
+exist yet, and retries exactly once after 30 seconds only when an attempt exits
+3 *and* left `drift-inconclusive.signal` with exactly
+`DRIFT_INCONCLUSIVE_V1\n`: the comparator writes that marker after its drift
+report, and only for a drift-control shift above 15%. A build, driver, Nix or
+timeout failure, a missing, partial or mismatched marker, an incomplete report
+or CSV, a marker on another status and an existing output root all stop at the
+first attempt. Two inconclusive attempts exit 3 and the step fails, so an
+unmeasured session is never reported as a pass. Long campaigns are run
+separately with `tests/security-fuzz-campaign.sh` and write only under an
+external `--out` directory.

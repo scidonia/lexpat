@@ -14,6 +14,16 @@ Two modes:
 
 A ratio row names its unit and construction. A regression finding cites the
 CSV path and line of the exact row it measured.
+
+The drift signal
+    `--ci --drift-signal <absolute-file>` makes this comparator create that
+    file exclusively, holding exactly `DRIFT_INCONCLUSIVE_V1\\n`, and only
+    after the report of a drift shift above 15% has been written. Status 3
+    marks that one classification; every other comparison failure keeps status
+    1, and a report or signal that cannot be written is status 1, never 3.
+    A signal path that already exists, including a dangling symlink, is
+    refused rather than reused. Paired mode never writes a signal: its
+    2.75/1.25/15% checks are not retried.
 """
 
 import argparse
@@ -23,9 +33,35 @@ import os
 import sys
 from pathlib import Path
 
+# The drift signal's entire content. A consumer compares the whole file with
+# these exact bytes instead of trusting the exit status to classify itself.
+SIGNAL_BYTES = b"DRIFT_INCONCLUSIVE_V1\n"
+
 
 class CompareError(Exception):
     pass
+
+
+class DriftInconclusive(CompareError):
+    """The drift control moved too far for this session to measure scaling."""
+
+
+def write_report(path, lines):
+    Path(path).write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def write_signal(path):
+    """Create the drift signal exclusively and write its full content."""
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    try:
+        view = memoryview(SIGNAL_BYTES)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise OSError("short write to the drift signal")
+            view = view[written:]
+    finally:
+        os.close(descriptor)
 
 
 def need(condition, message):
@@ -81,8 +117,9 @@ def check_drift(rows, report):
         report.append(f"drift {block}: before={before}ns after={after}ns "
                       f"shift={shift:.3f} "
                       f"(lines {pair['before']['_line']},{pair['after']['_line']})")
-        need(shift <= 0.15,
-             f"drift block {block} shifted {shift:.1%} (> 15%); inconclusive")
+        if shift > 0.15:
+            raise DriftInconclusive(
+                f"drift block {block} shifted {shift:.1%} (> 15%); inconclusive")
 
 
 def doubling(rows, threshold, report, side):
@@ -164,10 +201,23 @@ def main():
     parser.add_argument("--manifest-sha256")
     parser.add_argument("--path-blob-manifest")
     parser.add_argument("--candidate-source")
+    parser.add_argument("--drift-signal")
     args = parser.parse_args()
+
+    if args.drift_signal is not None:
+        if not args.ci:
+            parser.error("--drift-signal is only meaningful with --ci")
+        if not os.path.isabs(args.drift_signal):
+            parser.error("--drift-signal must be an absolute path")
+    signal_path = args.drift_signal
 
     report = []
     try:
+        if signal_path is not None:
+            # A signal left by an earlier attempt is not this attempt's
+            # evidence, so it is refused rather than deleted or overwritten.
+            need(not os.path.lexists(signal_path),
+                 f"the drift signal path already exists: {signal_path}")
         if args.ci:
             need(args.candidate_csv, "--ci needs --candidate-csv")
             rows = read_rows(args.candidate_csv)
@@ -241,17 +291,35 @@ def main():
         else:
             raise CompareError("select --ci or --pair")
 
-        Path(args.report).write_text("\n".join(report + lines) + "\n",
-                                     encoding="utf-8")
+        try:
+            write_report(args.report, report + lines)
+        except OSError as exc:
+            print(f"FAIL: cannot write the benchmark report {args.report}: "
+                  f"{exc}", file=sys.stderr)
+            return 1
         for line in lines:
             print(line)
         print(f"OK: benchmark thresholds satisfied; report {args.report}")
         return 0
     except CompareError as exc:
-        Path(args.report).write_text("\n".join(report) + f"\nFAIL: {exc}\n",
-                                     encoding="utf-8")
+        try:
+            write_report(args.report, report + [f"FAIL: {exc}"])
+        except OSError as write_exc:
+            print(f"FAIL: {exc}", file=sys.stderr)
+            print(f"FAIL: cannot write the benchmark report {args.report}: "
+                  f"{write_exc}", file=sys.stderr)
+            return 1
         print(f"FAIL: {exc}", file=sys.stderr)
-        return 1
+        if not isinstance(exc, DriftInconclusive):
+            return 1
+        if signal_path is not None:
+            try:
+                write_signal(signal_path)
+            except OSError as signal_exc:
+                print(f"FAIL: cannot write the drift signal {signal_path}: "
+                      f"{signal_exc}", file=sys.stderr)
+                return 1
+        return 3
 
 
 if __name__ == "__main__":

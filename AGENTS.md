@@ -31,6 +31,8 @@ nix develop -c python3 tests/security-cve.py
 nix develop -c bash tests/security-differential-fixed.sh --out /tmp/lexpat-diff
 nix develop -c bash tests/security-oom-sanitized.sh --out /tmp/lexpat-oom
 nix develop -c bash tests/security-benchmark.sh --suite ci --out /tmp/lexpat-bench
+bash tests/security-scaling-ci.sh --out /tmp/lexpat-scaling
+nix develop -c python3 tests/security-scaling-retry.py
 nix develop -c bash tests/security-fuzz-smoke.sh --out /tmp/lexpat-fuzz
 nix develop -c bash tests/no-admits.sh
 nix develop -c lake env lean LexPat/Encoding/Proofs.lean
@@ -43,12 +45,15 @@ point used by the fuzz target; it is not a default target and is not part of
 the library or the artifact. `.github/workflows/ci.yml` runs the library build,
 the clean build, the C ABI contracts A1, A2 and A3, one combined security step
 under a 300-second process-group deadline held by
-`scripts/run-bounded-security.py`, the C differential, the artifact
-verification, the memory checks, the one-shot contract, the streaming checks,
-the full differential, the `limits` group, the admit check and the proof audit,
-in that order, after installing Nix with flakes enabled. The security step
-runs CVE checks, the fixed differential replay, injected shim OOM, the
-benchmark smoke and the four-target fuzz smoke. Checkout uses
+`scripts/run-bounded-security.py`, the scaling sentinel in its own
+`timeout-minutes: 10` step through `tests/security-scaling-ci.sh`, the C
+differential, the artifact verification, the memory checks, the one-shot
+contract, the streaming checks, the full differential, the `limits` group, the
+admit check and the proof audit, in that order, after installing Nix with
+flakes enabled. The security step runs CVE checks, the fixed differential
+replay, injected shim OOM and the four-target fuzz smoke; it deliberately does
+not run the benchmark, so a shared runner's timing noise cannot consume the
+security budget or be reported as a security failure. Checkout uses
 `fetch-depth: 0` so the corpus identity comparison can resolve the base
 revision.
 
@@ -300,6 +305,22 @@ child's status. The log names the last `security-ci:` stage that started and is
 kept on every outcome. The hosted job adds `--build-dir` for a prepared fuzz
 build, which the step verifies before any target or parser runs.
 
+The scaling sentinel is a separate required step because it measures timing
+rather than security. `tests/security-scaling-ci.sh --out <absolute-directory>`
+requires a path that does not exist yet, gives each attempt its own
+`attempt-N` directory and log, and retries exactly once after 30 seconds when
+an attempt is drift-inconclusive: exit status 3 from
+`tests/security/benchmark_compare.py` together with that attempt's
+`drift-inconclusive.signal`, which holds exactly `DRIFT_INCONCLUSIVE_V1\n` and
+is created exclusively after the comparator wrote its report. A build,
+compiler, driver, Nix or timeout failure has no such marker and stops at the
+first attempt; a marker on any other status, an incomplete report or CSV, a
+partial or mismatched marker and an existing output root are errors, not
+retries. Two inconclusive attempts exit 3 and the step fails: the session is
+unmeasured, never green. `tests/security-scaling-retry.py` exercises the
+comparator's statuses and the shipped helper's retry policy with generated
+CSVs and process doubles.
+
 The original 108-case `tests/corpus/` tree is unchanged. Security-specific
 inputs, provenance and expectations live under `tests/security/` and are driven
 by `tests/security-cve.py`; a CVE row is a locally generated input or an
@@ -374,7 +395,12 @@ forked child and the parent records that child's `wait4` resident peak, so
 `pinned=cpu0` note together with `uname`, CPU model, core count, governor and
 load average in `flags`; a 1 KiB drift control before and after each family
 block fails the run above a 15% shift. Earlier full-suite readings from a
-different protocol are not evidence for the current one.
+different protocol are not evidence for the current one. `--suite ci` is the
+hosted sentinel and `--pair` is the local base/candidate evidence; neither
+establishes the other's bound. A CI-sentinel drift shift above 15% writes the
+drift report, creates `drift-inconclusive.signal` and exits 3, which is what
+`tests/security-scaling-ci.sh` retries once; `--pair` never writes a signal and
+is never retried.
 
 ## Performance benchmark
 

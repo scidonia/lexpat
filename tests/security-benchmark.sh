@@ -22,6 +22,13 @@
 # above 15%. Machine, CPU, governor and load facts are recorded beside the
 # pinned-CPU note. The CSV, report and identity arguments are written under
 # --out.
+#
+# Exit status in `ci` mode: 0 means every sentinel held, 1 a comparison
+# failure, and 3 that the drift control moved more than 15%, so the session
+# cannot measure scaling. Only the comparator can produce 3, and it also
+# leaves --out/drift-inconclusive.signal holding the exact bytes
+# `DRIFT_INCONCLUSIVE_V1\n`; a build, compiler, driver or Nix failure keeps its
+# own nonzero status and writes no signal. `pair` mode never writes a signal.
 set -euo pipefail
 
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -146,6 +153,7 @@ if [ "$mode" = "ci" ]; then
     --csv "$out/candidate.csv" | tee "$out/run.log"
   python3 "$repo/tests/security/benchmark_compare.py" --ci \
     --candidate-csv "$out/candidate.csv" \
+    --drift-signal "$out/drift-inconclusive.signal" \
     --report "$out/report.txt"
   echo "security-benchmark: PASS (CI suite; logs in $out)"
   exit 0

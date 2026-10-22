@@ -267,18 +267,31 @@ nix develop -c python3 tests/security-cve.py
 nix develop -c bash tests/security-differential-fixed.sh --out "$OUT/diff"
 nix develop -c bash tests/security-oom-sanitized.sh --out "$OUT/oom"
 nix develop -c bash tests/security-benchmark.sh --suite ci --out "$OUT/bench"
+bash tests/security-scaling-ci.sh --out "$OUT/scaling"
 nix develop -c bash tests/security-fuzz-smoke.sh --out "$OUT/fuzz"
 python3 scripts/run-bounded-security.py --seconds 300 --grace 5 \
   --log "$OUT/bounded.log" \
   -- nix develop -c bash tests/security-ci.sh --out "$OUT/ci"
 ```
 
-The last command runs `tests/security-ci.sh` under
-`scripts/run-bounded-security.py`: one 300-second monotonic deadline enforced
-outside `nix develop`, so it covers Nix startup and every child the step starts.
-A timeout exits 124 after the whole process group is terminated and reaped, a
-child that leaves a descendant behind exits 125, a failed sink or retained log
-exits 126, and the combined output is kept in `$OUT/bounded.log`.
+The `run-bounded-security.py` command runs `tests/security-ci.sh` under one
+300-second monotonic deadline enforced outside `nix develop`, so it covers Nix
+startup and every child the step starts. A timeout exits 124 after the whole
+process group is terminated and reaped, a child that leaves a descendant behind
+exits 125, a failed sink or retained log exits 126, and the combined output is
+kept in `$OUT/bounded.log`. That step runs the CVE checks, the fixed
+differential replay, injected shim OOM and the fuzz smoke; the benchmark is not
+part of it.
+
+`tests/security-scaling-ci.sh` is the separate scaling step CI runs right after
+it. `--out` must not exist yet; each attempt gets its own directory, log, CSV,
+report and drift signal. The comparator writes
+`drift-inconclusive.signal` with exactly `DRIFT_INCONCLUSIVE_V1\n` and exits 3
+only when the drift control moved more than 15%, and the helper retries once
+after 30 seconds only for that status plus that marker. A build, driver, Nix or
+timeout failure, a missing or mismatched marker, an incomplete report and an
+existing output root all stop at the first attempt; two inconclusive attempts
+exit 3, which fails the step instead of calling an unmeasured session green.
 
 `tests/security-fuzz-smoke.sh` runs the bounded parser, C ABI, shipped-artifact
 and in-process differential libFuzzer targets. The artifact target instruments
@@ -291,9 +304,10 @@ calls each through its own `dlsym` table, requiring
 `XML_ExpatVersionInfo()` to be exactly `2.8.5` before comparing. The paired
 benchmark interleaves base and candidate readings and one-shot/chunked trials,
 and measures each case in a forked child so its recorded RSS belongs to that
-case. Long campaigns run through `tests/security-fuzz-campaign.sh` with an
-external output directory. Fuzzing is stochastic and bounded: a completed
-campaign is not a proof that the parser is free of bugs.
+case; the CI sentinel above is a different reading and neither one establishes
+the other's bound. Long campaigns run through `tests/security-fuzz-campaign.sh`
+with an external output directory. Fuzzing is stochastic and bounded: a
+completed campaign is not a proof that the parser is free of bugs.
 
 ## Supported XML subset
 

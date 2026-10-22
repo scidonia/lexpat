@@ -158,7 +158,9 @@ step** after the fixed-differential stage header, and the job ran for about
 step passed. The timeout did not terminate the child process group, so the
 hosted failure left no stage-level output; the root cause is under
 investigation. The hosted result is not claimed as green, and the local
-evidence above is not a substitute for it.
+evidence above is not a substitute for it. This paragraph is the historical
+record of that M4 candidate; it describes neither the current pipeline nor its
+current state.
 
 ## Reproduction
 
@@ -178,12 +180,20 @@ nix develop -c python3 tests/security-cve.py
 nix develop -c bash tests/security-differential-fixed.sh --out /tmp/lexpat-diff
 nix develop -c bash tests/security-oom-sanitized.sh --out /tmp/lexpat-oom
 nix develop -c bash tests/security-benchmark.sh --suite ci --out /tmp/lexpat-bench
+bash tests/security-scaling-ci.sh --out /tmp/lexpat-scaling
 nix develop -c bash tests/security-fuzz-smoke.sh --out /tmp/lexpat-fuzz
 ```
 
 `tests/security-ci.sh --out <absolute-dir>` runs the CVE, fixed differential,
-injected OOM, benchmark smoke and fuzz smoke stages in order. Long campaigns
-use `tests/security-fuzz-campaign.sh` with the counts and seeds recorded in
+injected OOM and fuzz smoke stages in order. The scaling sentinel runs as its
+own required step: `tests/security-scaling-ci.sh` requires an `--out` that does
+not exist yet, keeps each attempt's log, CSV, report and drift signal, and
+retries once after 30 seconds only for a comparator exit status 3 accompanied
+by `drift-inconclusive.signal` holding exactly `DRIFT_INCONCLUSIVE_V1\n`. A
+build, driver, Nix or timeout failure, a missing or mismatched marker, an
+incomplete report and an existing output root stop at the first attempt; two
+inconclusive attempts exit 3 and fail the step. Long campaigns use
+`tests/security-fuzz-campaign.sh` with the counts and seeds recorded in
 `docs/security.md`; they write only under an external output directory. No
 campaign corpus, crash file, binary or per-run log is committed.
 
@@ -202,11 +212,17 @@ campaign corpus, crash file, binary or per-run log is committed.
   dereferences the handle directly.
 - Scaling and campaign thresholds apply to the measured shapes, sizes and host;
   they are not a complexity proof.
-- The last hosted run, for commit `4999987`, failed in the bounded security
-  step and the hosted result is not green. The process-group wrapper, per-stage
-  logs, prepared-build identity checks and failure artifact that address it are
-  present in the working tree; no hosted run has validated them yet, so they are
-  not hosted evidence.
+- The hosted runs for commit `3fd3b0a` failed at the benchmark-CI drift control
+  (63.9% and 21.5% > 15%) after the security stages, not at a scaling ratio, so
+  both sessions are inconclusive rather than a regression or a pass. The
+  pipeline now separates the two: `tests/security-ci.sh` keeps CVE, fixed
+  differential, injected OOM and fuzz smoke under the 300-second
+  process-group wrapper, and `.github/workflows/ci.yml` runs the scaling
+  sentinel as its own required `timeout-minutes: 10` step through
+  `tests/security-scaling-ci.sh`, which retries one drift-inconclusive attempt
+  and fails the step when both attempts are inconclusive. The M4 record for
+  `4999987` above is historical. No hosted run has validated this separation
+  yet, and the local controls and pair runs are not hosted evidence.
 - The C ABI remains a bounded subset, not a drop-in libexpat replacement.
 
 ## Change log
