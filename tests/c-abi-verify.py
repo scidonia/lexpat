@@ -23,7 +23,10 @@ The checks are grouped so each acceptance criterion has its own command:
                  resolver, including the parameter-entity timing rule
   --wire         malformed version-1 event frames and impossible source
                  metadata terminate only their parser without delivering a
-                 callback; an unhandled event allocates no payload copy
+                 callback; an impossible attribute-pair count is rejected
+                 before any vector allocation, a shim allocation failure is
+                 reported as `XML_ERROR_NO_MEMORY`, and an unhandled event
+                 allocates no payload copy
   --adversarial  NULL handles, invalid lengths, capacity arithmetic, re-entrant
                  parses, callback-time parser creation and free-in-callback
                  behavior
@@ -1312,6 +1315,11 @@ static void group_unsupported(void) {
            "unsupported: qualified names parse as raw names");
   XML_ParserFree(parser);
 
+  /* Printed so a caller that reuses this group as a verification command can
+   * read the numeric refusal code it observed, not only the assertions. */
+  printf("unsupported: refusals report code %d (XML_ERROR_UNSUPPORTED_FEATURE); "
+         "ExternalEntityParserCreate returns NULL\n",
+         (int)XML_ERROR_UNSUPPORTED_FEATURE);
   report("unsupported");
 }
 
@@ -1667,31 +1675,82 @@ extern uint64_t lexpat_cabi_reject_frame(uint64_t size);
 /* The shim copies callback payloads with malloc/calloc. Wrapping those two
  * symbols counts the linked shim's allocations only; the Lean runtime's own
  * allocator lives in its shared library and is unaffected. */
+/* The calloc wrapper refuses a request above this fixed cap instead of
+ * delegating it. A 16 MiB event frame can describe at most 2,097,148
+ * attribute pairs, whose vector is about 32 MiB, so the cap cannot interfere
+ * with a frame the format itself permits; an unbounded pair count would ask
+ * for tens of gigabytes. */
+#define CALLOC_CAP ((size_t)64 * 1024 * 1024)
+
 static int counting;
 static long allocations;
+static int calloc_calls;
+static size_t last_calloc;
+static unsigned long long oversized_request;
+static int oversized_calloc;
+/* -1 disarms; otherwise the named index of the next counting allocation fails
+ * once and the countdown clears. Only the directly linked shim is affected. */
+static int fail_malloc_countdown = -1;
+static int fail_calloc_countdown = -1;
+static int injected_failures;
 
 void *__real_malloc(size_t size);
 void *__real_calloc(size_t count, size_t size);
 
 void *__wrap_malloc(size_t size) {
-  if (counting)
+  if (counting) {
     allocations++;
+    if (fail_malloc_countdown >= 0) {
+      if (fail_malloc_countdown == 0) {
+        fail_malloc_countdown = -1;
+        injected_failures++;
+        return NULL;
+      }
+      fail_malloc_countdown--;
+    }
+  }
   return __real_malloc(size);
 }
 
 void *__wrap_calloc(size_t count, size_t size) {
-  if (counting)
+  if (counting) {
     allocations++;
+    calloc_calls++;
+    if (fail_calloc_countdown >= 0) {
+      if (fail_calloc_countdown == 0) {
+        fail_calloc_countdown = -1;
+        injected_failures++;
+        return NULL;
+      }
+      fail_calloc_countdown--;
+    }
+    if (count != 0 && size > SIZE_MAX / count) {
+      oversized_calloc++;
+      return NULL;
+    }
+    size_t total = count * size;
+    last_calloc = total;
+    if (total > CALLOC_CAP) {
+      oversized_calloc++;
+      oversized_request = (unsigned long long)total;
+      return NULL;
+    }
+  }
   return __real_calloc(count, size);
 }
 
 static XML_Parser P;
 static int calls;
 static int ends;
+static int decls;
+static int comments;
+static int pis;
 static int injects;
 static int which;
 static int last_emit;
 static int last_code;
+static int record_pairs;
+static int last_pairs;
 
 static lean_object *make_frame_full(uint8_t tag, uint64_t line, uint64_t offset,
                                     uint64_t column, uint32_t token,
@@ -1756,14 +1815,79 @@ static uint32_t put_string(unsigned char *out, const char *text) {
   return 4 + length;
 }
 
+static uint32_t put_u32(unsigned char *out, uint32_t value) {
+  out[0] = (unsigned char)(value & 0xff);
+  out[1] = (unsigned char)((value >> 8) & 0xff);
+  out[2] = (unsigned char)((value >> 16) & 0xff);
+  out[3] = (unsigned char)((value >> 24) & 0xff);
+  return 4;
+}
+
 static lean_object *start_frame(const char *name, uint32_t pairs_header) {
   unsigned char payload[512];
   uint32_t at = put_string(payload, name);
-  payload[at++] = 0;
-  payload[at++] = 0;
-  payload[at++] = 0;
-  payload[at++] = 0;
+  at += put_u32(payload + at, 0);
   return make_frame(1, 1, 0, 4u, pairs_header, 0, 0, 0, 0, payload, at);
+}
+
+/* A start frame whose payload declares `pairs` pairs and then carries none:
+ * a valid frame only when `pairs` is zero. */
+static lean_object *start_frame_count(const char *name, uint32_t pairs) {
+  unsigned char payload[512];
+  uint32_t at = put_string(payload, name);
+  at += put_u32(payload + at, pairs);
+  return make_frame(1, 1, 0, 4u, pairs, 0, 0, 0, 0, payload, at);
+}
+
+/* One start element with exactly one ordered attribute pair. */
+static lean_object *start_frame_pairs(void) {
+  unsigned char payload[128];
+  uint32_t at = put_string(payload, "x");
+  at += put_u32(payload + at, 1);
+  at += put_string(payload + at, "a");
+  at += put_string(payload + at, "1");
+  return make_frame(1, 1, 0, 4u, 1, 0, 0, 0, 0, payload, at);
+}
+
+static lean_object *decl_frame(int with_encoding) {
+  unsigned char payload[64];
+  uint32_t at = put_string(payload, "1.0");
+  payload[at++] = with_encoding ? 1 : 0;
+  if (with_encoding)
+    at += put_string(payload + at, "UTF-8");
+  payload[at++] = 0xFF;
+  return make_frame(0, 1, 0, 4u, 0, 0, 0, 0, 0, payload, at);
+}
+
+static lean_object *named_frame(uint8_t tag, const char *name) {
+  unsigned char payload[64];
+  uint32_t at = put_string(payload, name);
+  return make_frame(tag, 1, 0, 4u, 0, 0, 0, 0, 0, payload, at);
+}
+
+static lean_object *pi_frame(void) {
+  unsigned char payload[64];
+  uint32_t at = put_string(payload, "p");
+  at += put_string(payload + at, "d");
+  return make_frame(7, 1, 0, 4u, 0, 0, 0, 0, 0, payload, at);
+}
+
+/* Count one injected dispatch and let it be inspected afterwards. */
+static void arm(int fail_malloc, int fail_calloc) {
+  counting = 1;
+  allocations = 0;
+  calloc_calls = 0;
+  last_calloc = 0;
+  oversized_calloc = 0;
+  oversized_request = 0;
+  fail_malloc_countdown = fail_malloc;
+  fail_calloc_countdown = fail_calloc;
+}
+
+static void disarm(void) {
+  counting = 0;
+  fail_malloc_countdown = -1;
+  fail_calloc_countdown = -1;
 }
 
 static void inject(void) {
@@ -1871,6 +1995,91 @@ static void inject(void) {
     at = put_string(payload, "x");
     frame = make_frame_full(3, 1, 0, 0, 1, 0, 0, 0, 0, 0, payload, at);
     break;
+  case 20: /* affirmative control: one pair allocates a 24-byte vector */
+    record_pairs = 1;
+    arm(-1, -1);
+    frame = start_frame_pairs();
+    last_emit = (int)lexpat_cabi_emit_frame(frame);
+    disarm();
+    last_code = (int)XML_GetErrorCode(P);
+    return;
+  case 21: /* an impossible pair count the payload cannot describe */
+    arm(-1, -1);
+    frame = start_frame_count("x", (UINT32_MAX - 1) / 2);
+    last_emit = (int)lexpat_cabi_emit_frame(frame);
+    disarm();
+    last_code = (int)XML_GetErrorCode(P);
+    return;
+  case 22: /* a large count with no pair bytes behind it */
+    arm(-1, -1);
+    frame = start_frame_count("x", 1000u);
+    last_emit = (int)lexpat_cabi_emit_frame(frame);
+    disarm();
+    last_code = (int)XML_GetErrorCode(P);
+    return;
+  case 23: /* the start-name copy fails */
+    arm(0, -1);
+    frame = start_frame("x", 0);
+    last_emit = (int)lexpat_cabi_emit_frame(frame);
+    disarm();
+    last_code = (int)XML_GetErrorCode(P);
+    return;
+  case 24: /* the attribute-vector allocation fails */
+    arm(-1, 0);
+    frame = start_frame_pairs();
+    last_emit = (int)lexpat_cabi_emit_frame(frame);
+    disarm();
+    last_code = (int)XML_GetErrorCode(P);
+    return;
+  case 25: /* the first attribute-name copy fails after the element name */
+    arm(1, -1);
+    frame = start_frame_pairs();
+    last_emit = (int)lexpat_cabi_emit_frame(frame);
+    disarm();
+    last_code = (int)XML_GetErrorCode(P);
+    return;
+  case 26: /* the first attribute-value copy fails after the name copy */
+    arm(2, -1);
+    frame = start_frame_pairs();
+    last_emit = (int)lexpat_cabi_emit_frame(frame);
+    disarm();
+    last_code = (int)XML_GetErrorCode(P);
+    return;
+  case 27: /* the XML declaration version copy fails */
+    arm(0, -1);
+    frame = decl_frame(0);
+    last_emit = (int)lexpat_cabi_emit_frame(frame);
+    disarm();
+    last_code = (int)XML_GetErrorCode(P);
+    return;
+  case 28: /* the end-element name copy fails */
+    arm(0, -1);
+    frame = named_frame(2, "x");
+    last_emit = (int)lexpat_cabi_emit_frame(frame);
+    disarm();
+    last_code = (int)XML_GetErrorCode(P);
+    return;
+  case 29: /* the comment copy fails */
+    arm(0, -1);
+    frame = named_frame(6, "c");
+    last_emit = (int)lexpat_cabi_emit_frame(frame);
+    disarm();
+    last_code = (int)XML_GetErrorCode(P);
+    return;
+  case 30: /* the processing-instruction target copy fails */
+    arm(0, -1);
+    frame = pi_frame();
+    last_emit = (int)lexpat_cabi_emit_frame(frame);
+    disarm();
+    last_code = (int)XML_GetErrorCode(P);
+    return;
+  case 31: /* the XML declaration encoding copy fails after the version */
+    arm(1, -1);
+    frame = decl_frame(1);
+    last_emit = (int)lexpat_cabi_emit_frame(frame);
+    disarm();
+    last_code = (int)XML_GetErrorCode(P);
+    return;
   default:
     return;
   }
@@ -1882,8 +2091,14 @@ static void XMLCALL on_start(void *userData, const XML_Char *name,
                              const XML_Char **atts) {
   (void)userData;
   (void)name;
-  (void)atts;
   calls++;
+  if (record_pairs) {
+    int entries = 0;
+    if (atts != NULL)
+      while (atts[entries] != NULL)
+        entries++;
+    last_pairs = entries / 2;
+  }
   if (injects++ == 0)
     inject();
 }
@@ -1892,6 +2107,29 @@ static void XMLCALL on_end(void *userData, const XML_Char *name) {
   (void)userData;
   (void)name;
   ends++;
+}
+
+static void XMLCALL on_decl(void *userData, const XML_Char *version,
+                            const XML_Char *encoding, int standalone) {
+  (void)userData;
+  (void)version;
+  (void)encoding;
+  (void)standalone;
+  decls++;
+}
+
+static void XMLCALL on_comment(void *userData, const XML_Char *data) {
+  (void)userData;
+  (void)data;
+  comments++;
+}
+
+static void XMLCALL on_pi(void *userData, const XML_Char *target,
+                          const XML_Char *data) {
+  (void)userData;
+  (void)target;
+  (void)data;
+  pis++;
 }
 
 static int handler_calls;
@@ -1994,11 +2232,64 @@ static int check_unhandled_allocations(void) {
   return failures;
 }
 
+/* Per-frame expectations. `last_calloc` of 0 means "not asserted"; every other
+ * field is exact. `oversized_calloc` must stay zero: a frame the wire format
+ * can describe never justifies an allocation above the wrapper's cap. */
+typedef struct {
+  int emit;
+  int code;
+  int calls;
+  int ends;
+  int decls;
+  int comments;
+  int pis;
+  int calloc_calls;
+  size_t last_calloc;
+} Expect;
+
+static const Expect EXPECTATIONS[32] = {
+    [0] = {0, XML_ERROR_NONE, 2, 1, 0, 0, 0, 0, 0},
+    [1] = {1, XML_ERROR_MALFORMED_WIRE, 1, 0, 0, 0, 0, 0, 0},
+    [2] = {1, XML_ERROR_MALFORMED_WIRE, 1, 0, 0, 0, 0, 0, 0},
+    [3] = {1, XML_ERROR_MALFORMED_WIRE, 1, 0, 0, 0, 0, 0, 0},
+    [4] = {1, XML_ERROR_MALFORMED_WIRE, 1, 0, 0, 0, 0, 0, 0},
+    [5] = {1, XML_ERROR_MALFORMED_WIRE, 1, 0, 0, 0, 0, 0, 0},
+    [6] = {1, XML_ERROR_MALFORMED_WIRE, 1, 0, 0, 0, 0, 0, 0},
+    [7] = {1, XML_ERROR_MALFORMED_WIRE, 1, 0, 0, 0, 0, 0, 0},
+    [8] = {1, XML_ERROR_MALFORMED_WIRE, 1, 0, 0, 0, 0, 0, 0},
+    [9] = {1, XML_ERROR_MALFORMED_WIRE, 1, 0, 0, 0, 0, 0, 0},
+    [10] = {1, XML_ERROR_MALFORMED_WIRE, 1, 0, 0, 0, 0, 0, 0},
+    [11] = {1, XML_ERROR_MALFORMED_WIRE, 1, 0, 0, 0, 0, 0, 0},
+    [12] = {1, XML_ERROR_LIMIT_TOKEN, 1, 0, 0, 0, 0, 0, 0},
+    [13] = {1, XML_ERROR_MALFORMED_WIRE, 1, 0, 0, 0, 0, 0, 0},
+    [14] = {1, XML_ERROR_MALFORMED_WIRE, 1, 0, 0, 0, 0, 0, 0},
+    [15] = {1, XML_ERROR_MALFORMED_WIRE, 1, 0, 0, 0, 0, 0, 0},
+    [16] = {1, XML_ERROR_MALFORMED_WIRE, 1, 0, 0, 0, 0, 0, 0},
+    [17] = {1, XML_ERROR_MALFORMED_WIRE, 1, 0, 0, 0, 0, 0, 0},
+    [18] = {1, XML_ERROR_MALFORMED_WIRE, 1, 0, 0, 0, 0, 0, 0},
+    [19] = {1, XML_ERROR_MALFORMED_WIRE, 1, 0, 0, 0, 0, 0, 0},
+    [20] = {0, XML_ERROR_NONE, 2, 1, 0, 0, 0, 1, 24},
+    [21] = {1, XML_ERROR_MALFORMED_WIRE, 1, 0, 0, 0, 0, 0, 0},
+    [22] = {1, XML_ERROR_MALFORMED_WIRE, 1, 0, 0, 0, 0, 0, 0},
+    [23] = {1, XML_ERROR_NO_MEMORY, 1, 0, 0, 0, 0, 0, 0},
+    [24] = {1, XML_ERROR_NO_MEMORY, 1, 0, 0, 0, 0, 1, 0},
+    [25] = {1, XML_ERROR_NO_MEMORY, 1, 0, 0, 0, 0, 1, 0},
+    [26] = {1, XML_ERROR_NO_MEMORY, 1, 0, 0, 0, 0, 1, 0},
+    [27] = {1, XML_ERROR_NO_MEMORY, 1, 0, 0, 0, 0, 0, 0},
+    [28] = {1, XML_ERROR_NO_MEMORY, 1, 0, 0, 0, 0, 0, 0},
+    [29] = {1, XML_ERROR_NO_MEMORY, 1, 0, 0, 0, 0, 0, 0},
+    [30] = {1, XML_ERROR_NO_MEMORY, 1, 0, 0, 0, 0, 0, 0},
+    [31] = {1, XML_ERROR_NO_MEMORY, 1, 0, 0, 0, 0, 0, 0},
+};
+
 int main(void) {
   int failures = 0;
-  for (which = 0; which <= 19; which++) {
+  for (which = 0; which <= 31; which++) {
+    const Expect *want = &EXPECTATIONS[which];
     enum XML_Status status;
     enum XML_Error code;
+    enum XML_Status want_status =
+        want->code == XML_ERROR_NONE ? XML_STATUS_OK : XML_STATUS_ERROR;
     P = XML_ParserCreate(NULL);
     if (P == NULL) {
       fputs("wire: cannot create a parser\n", stderr);
@@ -2006,36 +2297,42 @@ int main(void) {
     }
     calls = 0;
     ends = 0;
+    decls = 0;
+    comments = 0;
+    pis = 0;
     injects = 0;
+    record_pairs = 0;
+    last_pairs = -1;
     last_emit = -1;
     last_code = -1;
+    injected_failures = 0;
     XML_SetElementHandler(P, on_start, on_end);
+    XML_SetXmlDeclHandler(P, on_decl);
+    XML_SetCommentHandler(P, on_comment);
+    XML_SetProcessingInstructionHandler(P, on_pi);
     status = XML_Parse(P, "<r/>", 4, 1);
     code = XML_GetErrorCode(P);
-    if (which == 0) {
-      /* The affirmative control proves the fabricated-frame path reaches the
-       * registered handler and does not poison the parser. */
-      if (status != XML_STATUS_OK || code != XML_ERROR_NONE || calls != 2 || ends != 1
-          || last_emit != 0 || last_code != XML_ERROR_NONE) {
-        fprintf(stderr, "wire: control frame was not delivered (status %d code %d calls %d ends %d)\n",
-                (int)status, (int)code, calls, ends);
-        failures++;
-      }
-    } else if (which == 12) {
-      if (status != XML_STATUS_ERROR || code != XML_ERROR_LIMIT_TOKEN || last_emit == 0
-          || last_code != XML_ERROR_LIMIT_TOKEN || ends != 0) {
-        fprintf(stderr, "wire: frame-bound refusal case failed (status %d code %d last %d/%d ends %d)\n",
-                (int)status, (int)code, last_emit, last_code, ends);
-        failures++;
-      }
-    } else {
-      if (status != XML_STATUS_ERROR || code != XML_ERROR_MALFORMED_WIRE
-          || last_emit == 0 || last_code != XML_ERROR_MALFORMED_WIRE || ends != 0
-          || calls != 1) {
-        fprintf(stderr, "wire: malformed case %d failed (status %d code %d last %d/%d calls %d ends %d)\n",
-                which, (int)status, (int)code, last_emit, last_code, calls, ends);
-        failures++;
-      }
+    if (status != want_status || code != (enum XML_Error)want->code
+        || last_emit != want->emit
+        || last_code != want->code || calls != want->calls || ends != want->ends
+        || decls != want->decls || comments != want->comments || pis != want->pis
+        || calloc_calls != want->calloc_calls || oversized_calloc != 0
+        || (want->last_calloc != 0 && last_calloc != want->last_calloc)) {
+      fprintf(stderr,
+              "wire: case %d failed (status %d/%d code %d/%d emit %d/%d "
+              "callbacks calls %d/%d ends %d/%d decls %d/%d comments %d/%d "
+              "pis %d/%d calloc %d/%d size %lu/%lu oversized %d request %llu)\n",
+              which, (int)status, (int)want_status, (int)code, want->code,
+              last_emit, want->emit, calls, want->calls, ends, want->ends, decls,
+              want->decls, comments, want->comments, pis, want->pis, calloc_calls,
+              want->calloc_calls, (unsigned long)last_calloc,
+              (unsigned long)want->last_calloc, oversized_calloc, oversized_request);
+      failures++;
+    }
+    if (which == 20 && last_pairs != 1) {
+      fprintf(stderr, "wire: pair control saw %d attribute pairs, want 1\n",
+              last_pairs);
+      failures++;
     }
     XML_ParserFree(P);
   }
@@ -2044,7 +2341,9 @@ int main(void) {
     fprintf(stderr, "verify: wire: %d cases failed\n", failures);
     return 1;
   }
-  printf("PASS wire (20 frames; unhandled events allocate no payload copy)\n");
+  printf("PASS wire (32 frames; impossible pair counts allocate nothing, "
+         "shim allocation failures report NO_MEMORY, malformed frames terminate "
+         "only their parser, unhandled events allocate no payload copy)\n");
   return 0;
 }
 """
@@ -2699,15 +2998,62 @@ class Checks:
         need("inspection and differential" in compatibility,
              "docs/compatibility.md no longer limits the M1/M2 surfaces")
 
+        security_path = ROOT / "docs" / "security.md"
+        need(security_path.exists(),
+             "docs/security.md is missing")
+        security = normalize(security_path.read_text(encoding="utf-8"))
+        for phrase in ("not a drop-in replacement", "not free of bugs",
+                       "Lean runtime", "LSan", "Valgrind",
+                       "library coverage is absent", "XML_ERROR_NO_MEMORY",
+                       "stochastic", "post-free"):
+            need(phrase in security,
+                 f"docs/security.md lacks the limitation: {phrase}")
+        for command in ("tests/security-cve.py",
+                        "tests/security-differential-fixed.sh",
+                        "tests/security-oom-sanitized.sh",
+                        "tests/security-benchmark.sh",
+                        "tests/security-fuzz-smoke.sh",
+                        "tests/security-ci.sh"):
+            need(command in security,
+                 f"docs/security.md omits the command: {command}")
+        need("docs/security.md" in readme,
+             "README does not link the security threat model")
+        need("XML_ERROR_NO_MEMORY" in readme,
+             "README does not explain the corrected allocation error")
+        need("tests/c-abi-oom-contract.sh A3" in readme,
+             "README does not name the public allocation contract")
+        need("limit-decl-name-exact" in compatibility
+             and "twelve actual exception rows" in compatibility,
+             "docs/compatibility.md does not state the corrected exception and "
+             "budget facts")
+
+        for name in ("cve-cases.json", "SOURCES.md",
+                     "differential-exceptions.json"):
+            need((ROOT / "tests" / "security" / name).exists(),
+                 f"tests/security/{name} is missing")
+
         for command in ("nix develop -c bash tests/c-abi-contract.sh",
                         "nix develop -c python3 tests/c-abi-differential.py",
                         "nix develop -c python3 tests/c-abi-verify.py",
-                        "nix develop -c bash tests/c-abi-memory.sh"):
+                        "nix develop -c bash tests/c-abi-memory.sh",
+                        "nix develop -c bash tests/c-abi-oom-contract.sh A3",
+                        "nix develop -c python3 tests/security-cve.py",
+                        "nix develop -c bash tests/security-differential-fixed.sh",
+                        "nix develop -c bash tests/security-oom-sanitized.sh",
+                        "nix develop -c bash tests/security-benchmark.sh",
+                        "nix develop -c bash tests/security-fuzz-smoke.sh",
+                        "nix develop -c bash tests/security-ci.sh"):
             need(command in agents, f"AGENTS.md omits the test command: {command}")
         need("ASan" in agents and "Valgrind" in agents,
              "AGENTS.md does not record the memory detectors and their limits")
         need("# library, proofs and the C ABI artifact" in agents,
              "AGENTS.md understates what the default lake build produces")
+        need("lake build FuzzParser" in agents,
+             "AGENTS.md omits the test-only fuzz parser target")
+        need("library coverage is absent" in agents,
+             "AGENTS.md does not record the artifact target's coverage limit")
+        need("2.8.5" in agents,
+             "AGENTS.md does not record the pinned oracle assertion")
 
         need("include/expat.h" in trace,
              "the trace documentation does not point at the separate C header")
@@ -2717,6 +3063,8 @@ class Checks:
         for snippet in ("nix develop -c bash tests/clean-build.sh",
                         "nix develop -c bash tests/c-abi-contract.sh A1",
                         "nix develop -c bash tests/c-abi-contract.sh A2",
+                        "nix develop -c bash tests/c-abi-oom-contract.sh A3",
+                        "nix develop -c bash tests/security-ci.sh",
                         "nix develop -c python3 tests/c-abi-differential.py",
                         "nix develop -c python3 tests/c-abi-verify.py",
                         "nix develop -c bash tests/c-abi-memory.sh",
@@ -2727,20 +3075,28 @@ class Checks:
                         "nix develop -c bash tests/no-admits.sh",
                         "nix develop -c lake env lean LexPat/Encoding/Proofs.lean"):
             need(snippet in workflow, f"CI omits the step: {snippet}")
-        positions = [workflow.index(f"run: {snippet}") for snippet in
-                     ("nix develop -c lake build",
-                      "nix develop -c bash tests/clean-build.sh",
-                      "nix develop -c bash tests/c-abi-contract.sh A1",
-                      "nix develop -c bash tests/c-abi-contract.sh A2",
-                      "nix develop -c python3 tests/c-abi-differential.py",
-                      "nix develop -c python3 tests/c-abi-verify.py",
-                      "nix develop -c bash tests/c-abi-memory.sh",
-                      "nix develop -c lake env lean --run tests/OneShotPrecedence.lean",
-                      "nix develop -c python3 tests/streaming.py",
-                      "nix develop -c python3 tests/differential.py",
-                      "nix develop -c python3 tests/differential.py --group limits",
-                      "nix develop -c bash tests/no-admits.sh",
-                      "nix develop -c lake env lean LexPat/Encoding/Proofs.lean")]
+        need("fetch-depth: 0" in workflow,
+             "CI does not fetch the base revision for the corpus comparison")
+        need("timeout --signal=TERM --kill-after=5s 300s" in workflow,
+             "CI does not apply the 300-second outer cap to the security step")
+        order = [
+            "run: nix develop -c lake build",
+            "run: nix develop -c bash tests/clean-build.sh",
+            "run: nix develop -c bash tests/c-abi-contract.sh A1",
+            "run: nix develop -c bash tests/c-abi-contract.sh A2",
+            "run: nix develop -c bash tests/c-abi-oom-contract.sh A3",
+            "tests/security-ci.sh",
+            "run: nix develop -c python3 tests/c-abi-differential.py",
+            "run: nix develop -c python3 tests/c-abi-verify.py",
+            "run: nix develop -c bash tests/c-abi-memory.sh",
+            "run: nix develop -c lake env lean --run tests/OneShotPrecedence.lean",
+            "run: nix develop -c python3 tests/streaming.py",
+            "run: nix develop -c python3 tests/differential.py",
+            "run: nix develop -c python3 tests/differential.py --group limits",
+            "run: nix develop -c bash tests/no-admits.sh",
+            "run: nix develop -c lake env lean LexPat/Encoding/Proofs.lean",
+        ]
+        positions = [workflow.index(marker) for marker in order]
         need(positions == sorted(positions), "CI steps are out of order")
 
         need((ROOT / "tests" / "c-abi-client.c").exists()

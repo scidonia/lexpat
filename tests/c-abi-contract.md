@@ -9,7 +9,13 @@ process against the locally built shared object and the checked-in header:
 nix develop -c bash tests/c-abi-contract.sh A1
 nix develop -c bash tests/c-abi-contract.sh A2
 nix develop -c bash tests/c-abi-contract.sh
+nix develop -c bash tests/c-abi-oom-contract.sh A3
 ```
+
+A1 and A2 load the locally built shared object. A3 links `cabi/expat.c` and
+the Lean module objects directly into a test-only executable, so the allocator
+wrapper placed with `-Wl,--wrap=malloc` covers the shim's own allocations;
+wrapping the prebuilt shared object at run time would not intercept them.
 
 ### A1 — A parser delivers ordered element callbacks during XML_Parse
 
@@ -58,3 +64,30 @@ candidate did not receive.
 **Why.** Registration of an unsupported entity-resolving handler must refuse the
 parser deterministically before any input is read, rather than accept the
 handler and later attempt resolution.
+
+### A3 — A failed shim allocation during XML_Parse is reported as NO_MEMORY
+
+**Actor.** A C application linked to a test-only direct-linked build of
+`cabi/expat.c` and the Lean module objects, with a deterministic allocator
+wrapper.
+
+**Given.** Two fresh parsers. The same start/end detector is registered on
+both through `XML_SetUserData` and `XML_SetElementHandler`. The
+affirmative-control parser first parses `<r/>` with the allocator intact and
+records one start callback, which also warms the Lean runtime. A fresh
+candidate parser is then created, its detector registered, and the allocator
+wrapper is armed to fail the first `malloc` the linked shim makes during the
+candidate parse.
+
+**When.** The application calls `XML_Parse(candidate, "<r/>", 4, 1)` once on
+the candidate parser.
+
+**Then.** That call returns `XML_STATUS_ERROR`, `XML_GetErrorCode(candidate)`
+equals `XML_ERROR_NO_MEMORY`, and the candidate detector has recorded zero
+start callbacks while the control detector holds one. The status, the error
+code and the callback count are read from the same candidate parser the
+failed allocation belongs to.
+
+**Why.** An allocation the shim cannot satisfy while dispatching a callback is
+an out-of-memory condition, not a malformed wire frame; reporting it as
+`XML_ERROR_NO_MEMORY` keeps the failure attributable to resource exhaustion.

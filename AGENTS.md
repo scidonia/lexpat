@@ -18,23 +18,37 @@ nix develop -c lake exe lexpatTrace --chunk-size 1 tests/corpus/basic.xml
 nix develop -c bash tests/clean-build.sh
 nix develop -c bash tests/c-abi-contract.sh A1
 nix develop -c bash tests/c-abi-contract.sh A2
+nix develop -c bash tests/c-abi-oom-contract.sh A3
 nix develop -c python3 tests/c-abi-differential.py
 nix develop -c python3 tests/c-abi-verify.py
+nix develop -c python3 tests/c-abi-verify.py --wire
 nix develop -c bash tests/c-abi-memory.sh
 nix develop -c python3 tests/streaming.py
 nix develop -c python3 tests/differential.py
 nix develop -c python3 tests/differential.py --group limits
+nix develop -c python3 tests/security-cve.py
+nix develop -c bash tests/security-differential-fixed.sh --out /tmp/lexpat-diff
+nix develop -c bash tests/security-oom-sanitized.sh --out /tmp/lexpat-oom
+nix develop -c bash tests/security-benchmark.sh --suite ci --out /tmp/lexpat-bench
+nix develop -c bash tests/security-fuzz-smoke.sh --out /tmp/lexpat-fuzz
 nix develop -c bash tests/no-admits.sh
 nix develop -c lake env lean LexPat/Encoding/Proofs.lean
 ```
 
 `lake build` builds the default library, the proofs and the C ABI artifact;
 `LexPat/Exe` is excluded and the executable is deliberately not a default
-target. `.github/workflows/ci.yml` runs the library build, the clean build, the
-two C ABI contracts, the C differential, the artifact verification, the memory
-checks, the one-shot contract, the streaming checks, the full differential, the
-`limits` group, the admit check and the proof audit, in that order, after
-installing Nix with flakes enabled.
+target. `lake build FuzzParser` type-checks the test-only raw parser entry
+point used by the fuzz target; it is not a default target and is not part of
+the library or the artifact. `.github/workflows/ci.yml` runs the library build,
+the clean build, the C ABI contracts A1, A2 and A3, one combined security step
+under a 300-second outer timeout, the C differential, the artifact
+verification, the memory checks, the one-shot contract, the streaming checks,
+the full differential, the `limits` group, the admit check and the proof audit,
+in that order, after installing Nix with flakes enabled. The security step
+runs CVE checks, the fixed differential replay, injected shim OOM, the
+benchmark smoke and the four-target fuzz smoke. Checkout uses
+`fetch-depth: 0` so the corpus identity comparison can resolve the base
+revision.
 
 A git-backed flake evaluates the **staged** tree. Stage new or changed flake
 inputs (`flake.nix`, `flake.lock`, `lean-toolchain`, `lakefile.lean`,
@@ -212,6 +226,90 @@ the executed paths; a `possibly lost` block at exit and still-reachable runtime
 state are visible in its log rather than suppressed. Neither detector proves
 memory safety for every input, and neither is evidence about resident memory.
 `tests/c-abi-smoke.sh` is the capability smoke, not the contract.
+
+## Security boundary
+
+`docs/security.md` is the published threat model: supported route, budgets, the
+CVE-class table, allocation-failure behavior, pointer lifetime and the limits of
+the evidence. The C ABI remains the only supported integration route. The
+combined bounded step is
+`timeout --signal=TERM --kill-after=5s 300s nix develop -c bash tests/security-ci.sh --out <absolute-directory>`.
+
+The original 108-case `tests/corpus/` tree is unchanged. Security-specific
+inputs, provenance and expectations live under `tests/security/` and are driven
+by `tests/security-cve.py`; a CVE row is a locally generated input or an
+explicit reference to an existing corpus case, never an imported attachment.
+`tests/security/differential-exceptions.json` accounts for all twelve corpus
+exception rows and resolves each side's expectation from the corpus objects;
+`tests/security-differential-fixed.sh` replays them through the same
+`dlopen` comparator as the differential fuzz target and requires the pair to
+differ. The replay driver runs one `--compare both` invocation per case, so
+both libraries are loaded and called in one process rather than in two
+separate runs.
+
+The differential targets share one topology: neither parser is linked into the
+executable. The candidate (coverage + ASan/UBSan instrumented
+`liblexpat-diff.so` for the fuzzer, the shipped `liblexpat.so.1` for the
+replay) and the pinned, uninstrumented `libexpat.so.1` are each loaded with
+`dlopen(..., RTLD_NOW | RTLD_LOCAL)` and called through their own `dlsym`
+table, so the two `XML_*` surfaces cannot collide. The candidate library's
+sanitizer references resolve from the static runtime the ASan fuzzer
+executable carries; that is why it is linked without `--no-undefined`, while
+the shipped artifact keeps that check. The differential fuzzer measures
+candidate coverage and sanitizer state for generated documents; the oracle is
+never instrumented.
+
+The differential targets require the pinned oracle before comparing:
+`pkg-config --modversion expat` must be exactly `2.8.5`,
+`XML_ExpatVersion()` must be exactly `expat_2.8.5`, and
+`XML_ExpatVersionInfo()` must be exactly `{2,8,5}`. The comparator re-reads
+all three on every run; the build/replay drivers repeat the `pkg-config`
+identity so a mismatch fails before the targets are produced or replayed.
+Both `tests/differential.py` and `tests/c-abi-differential.py` fail on the
+same prerequisite. A near match such as `2.8.50`, or a missing
+`XML_ExpatVersionInfo`, is a prerequisite failure, not an exception.
+
+Allocation injection is test-only. `tests/security-oom-sanitized.sh` links
+`cabi/expat.c` and the Lean module objects directly so `--wrap=malloc/calloc/free`
+reaches the shim; the shipped `.so` is not intercepted, LD_PRELOAD is not used,
+and no Lean-runtime allocation is faulted. The wrapper's allocation/free ledger
+is the cleanup detector because LSan is off for the one-time Lean/libuv startup
+allocation. `tests/c-abi-oom-contract.sh A3` is the public-boundary scenario;
+`tests/c-abi-verify.py --wire` covers the internal frame bound and the shim
+allocation classification.
+
+The fuzz build is reproducible from the locked inputs:
+`scripts/security-fuzz-build.sh --out <absolute-directory>` compiles the
+generated Lean C and `cabi/expat.c` with the flake-locked Clang 21.1.8 and
+Clang coverage + ASan/UBSan. Those objects feed the parser and C ABI targets
+directly and are also linked into `liblexpat-diff.so`, which the differential
+fuzzer and the replay comparator load with `dlopen` rather than linking. The
+script separately links the shipped artifact with only the harness
+instrumented, and runs the replay's exact oracle guard before returning. The
+parser, C ABI and differential targets therefore observe candidate
+instructions; the artifact target's library coverage is absent by
+construction. Because the differential executable contains no Lean objects,
+its candidate coverage is the `liblexpat-diff.so` module registered at load
+time, not the harness alone. `tests/security-fuzz-smoke.sh` runs the fixed CI
+budget (parser 10,000; C ABI 10,000; artifact 2,000; differential 5,000
+inputs) under per-target caps. `tests/security-fuzz-campaign.sh` records a long
+campaign's seed, exact count, elapsed time, resident peak RSS, source revision,
+build and initial corpus digests under an external `--out`; a cap reached
+before the requested count is incomplete, never a pass. Fuzzing is stochastic
+and bounded and does not establish the absence of defects.
+
+The benchmark driver schedules one entry (case, drift control or limit-adjacent
+input) at a time. `tests/security-benchmark.sh --pair` walks that plan once and
+runs the base and candidate binaries back to back for each entry, alternating
+which side goes first; it never runs one side's whole suite before the other.
+Within a case the one-shot and 64-byte-chunk trials alternate rather than all
+one-shot samples preceding all chunked samples. Each entry is measured in a
+forked child and the parent records that child's `wait4` resident peak, so
+`rss_kb` is attributable to the entry. The driver records the unpinned or
+`pinned=cpu0` note together with `uname`, CPU model, core count, governor and
+load average in `flags`; a 1 KiB drift control before and after each family
+block fails the run above a 15% shift. Earlier full-suite readings from a
+different protocol are not evidence for the current one.
 
 ## Corpus
 

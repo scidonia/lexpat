@@ -12,6 +12,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # The security step compares the complete corpus tree with the base
+          # revision, so the base commit must be in the checkout.
+          fetch-depth: 0
 
       # Nix and flakes must exist before any `nix develop` command.
       - uses: cachix/install-nix-action@v31
@@ -29,6 +33,18 @@ jobs:
 
       - name: C ABI contract A2
         run: nix develop -c bash tests/c-abi-contract.sh A2
+
+      - name: C ABI callback allocation contract A3
+        run: nix develop -c bash tests/c-abi-oom-contract.sh A3
+
+      # One step covers CVE checks, the fixed differential replay, injected
+      # shim OOM, the benchmark smoke and the four-target fuzz smoke. The
+      # outer cap starts before Nix shell evaluation.
+      - name: bounded security checks
+        run: |
+          security_out="$(mktemp -d "${RUNNER_TEMP:-/tmp}/lexpat-security.XXXXXX")"
+          timeout --signal=TERM --kill-after=5s 300s \
+            nix develop -c bash tests/security-ci.sh --out "$security_out"
 
       - name: C ABI differential against libexpat
         run: nix develop -c python3 tests/c-abi-differential.py

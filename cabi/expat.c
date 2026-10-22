@@ -375,12 +375,22 @@ static char *copyString(WireString value) {
 static void beginCallback(XML_Parser parser) { parser->inCallback = 1; }
 static void endCallback(XML_Parser parser) { parser->inCallback = 0; }
 
+/* `allocationFailed` distinguishes an exhausted C allocation from a frame the
+ * payload does not describe: both return 0, but only the former is
+ * `XML_ERROR_NO_MEMORY`. */
 static int dispatchStart(XML_Parser parser, WireString name, Reader *payload,
-                         uint32_t expectedPairs) {
+                         uint32_t expectedPairs, int *allocationFailed) {
   uint32_t pairs;
   if (!readU32(payload, &pairs) || pairs != expectedPairs)
     return 0;
   if (pairs > (UINT32_MAX - 1) / 2)
+    return 0;
+  /* Every pair carries a 32-bit name length, the name, a 32-bit value length
+   * and the value, so it occupies at least eight payload bytes. A count the
+   * remaining payload cannot describe is malformed; reject it before sizing
+   * the vector it would have requested. */
+  if (payload->pos > payload->size ||
+      pairs > (payload->size - payload->pos) / 8)
     return 0;
 
   /* A parser without a start handler still validates the frame, but nothing
@@ -396,13 +406,16 @@ static int dispatchStart(XML_Parser parser, WireString name, Reader *payload,
   }
 
   char *elementName = copyString(name);
-  if (elementName == NULL)
+  if (elementName == NULL) {
+    *allocationFailed = 1;
     return 0;
+  }
 
   size_t slots = (size_t)pairs * 2 + 1;
   char **atts = (char **)calloc(slots, sizeof(char *));
   if (atts == NULL) {
     free(elementName);
+    *allocationFailed = 1;
     return 0;
   }
 
@@ -416,8 +429,10 @@ static int dispatchStart(XML_Parser parser, WireString name, Reader *payload,
     }
     atts[i * 2] = copyString(attrName);
     atts[i * 2 + 1] = copyString(attrValue);
-    if (atts[i * 2] == NULL || atts[i * 2 + 1] == NULL)
+    if (atts[i * 2] == NULL || atts[i * 2 + 1] == NULL) {
       ok = 0;
+      *allocationFailed = 1;
+    }
   }
   atts[slots - 1] = NULL;
 
@@ -439,7 +454,8 @@ static int dispatchStart(XML_Parser parser, WireString name, Reader *payload,
   return ok;
 }
 
-static int dispatchWire(XML_Parser parser, const unsigned char *bytes, size_t size) {
+static int dispatchWire(XML_Parser parser, const unsigned char *bytes, size_t size,
+                        int *allocationFailed) {
   Reader reader = {bytes, size, 0};
   const unsigned char *magic;
   uint8_t version;
@@ -520,6 +536,7 @@ static int dispatchWire(XML_Parser parser, const unsigned char *bytes, size_t si
     if (versionCopy == NULL || (haveEncoding && encodingCopy == NULL)) {
       free(versionCopy);
       free(encodingCopy);
+      *allocationFailed = 1;
       return 0;
     }
     {
@@ -537,7 +554,7 @@ static int dispatchWire(XML_Parser parser, const unsigned char *bytes, size_t si
     WireString name;
     if (!readString(&reader, &name))
       return 0;
-    return dispatchStart(parser, name, &reader, attributePairs);
+    return dispatchStart(parser, name, &reader, attributePairs, allocationFailed);
   }
   case 2: { /* end element */
     WireString name;
@@ -546,8 +563,10 @@ static int dispatchWire(XML_Parser parser, const unsigned char *bytes, size_t si
     if (parser->endHandler == NULL)
       return 1;
     char *copy = copyString(name);
-    if (copy == NULL)
+    if (copy == NULL) {
+      *allocationFailed = 1;
       return 0;
+    }
     beginCallback(parser);
     parser->endHandler(parser->userData, copy);
     endCallback(parser);
@@ -593,8 +612,10 @@ static int dispatchWire(XML_Parser parser, const unsigned char *bytes, size_t si
     if (parser->commentHandler == NULL)
       return 1;
     char *copy = copyString(data);
-    if (copy == NULL)
+    if (copy == NULL) {
+      *allocationFailed = 1;
       return 0;
+    }
     beginCallback(parser);
     parser->commentHandler(parser->userData, copy);
     endCallback(parser);
@@ -614,6 +635,7 @@ static int dispatchWire(XML_Parser parser, const unsigned char *bytes, size_t si
     if (targetCopy == NULL || dataCopy == NULL) {
       free(targetCopy);
       free(dataCopy);
+      *allocationFailed = 1;
       return 0;
     }
     beginCallback(parser);
@@ -636,11 +658,15 @@ uint64_t lexpat_cabi_emit_frame(lean_object *frame) {
   }
   size_t size = lean_sarray_size(frame);
   const unsigned char *bytes = lean_sarray_cptr(frame);
-  int ok = dispatchWire(parser, bytes, size);
+  int allocationFailed = 0;
+  int ok = dispatchWire(parser, bytes, size, &allocationFailed);
   lean_dec_ref(frame);
   if (!ok) {
+    /* A callback payload the shim could not allocate is an exhausted
+     * allocation, not a malformed frame; both are terminal, and `poison`
+     * preserves an earlier error. */
     if (parser->error == XML_ERROR_NONE)
-      poison(parser, XML_ERROR_MALFORMED_WIRE);
+      poison(parser, allocationFailed ? XML_ERROR_NO_MEMORY : XML_ERROR_MALFORMED_WIRE);
     return 1;
   }
   if (parser->deferredFree || parser->error != XML_ERROR_NONE)

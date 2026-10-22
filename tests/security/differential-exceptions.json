@@ -1,0 +1,78 @@
+{
+  "format": 1,
+  "note": "Every intentional candidate/reference difference in tests/corpus, replayed through the same in-process comparator. Each row references one fixed corpus case and resolves the candidate outcome to that case's exact `expected` object and the oracle outcome to its exact `reference` object; the replay asserts both and requires the pair to still differ. The corpus bytes are unchanged.",
+  "cases": [
+    {
+      "case": "att-utf16-odd-length",
+      "reason": "an odd trailing UTF-16 byte is rejected locally as oddUtf16Length; Expat reports UNCLOSED_TOKEN",
+      "candidate": "corpus:expected",
+      "oracle": "corpus:reference"
+    },
+    {
+      "case": "att-bom-vs-latin1-decl",
+      "reason": "a UTF-8 BOM contradicted by a Latin-1 declaration is refused locally; this Expat build accepts the declaration",
+      "candidate": "corpus:expected",
+      "oracle": "corpus:reference"
+    },
+    {
+      "case": "xml-supplementary-name",
+      "reason": "XML 1.0 Fifth Edition NameStartChar accepts a supplementary-plane name; this libexpat build rejects it",
+      "candidate": "corpus:expected",
+      "oracle": "corpus:reference"
+    },
+    {
+      "case": "bad-doctype-plain",
+      "reason": "every DOCTYPE is refused locally as unsupportedDtd; Expat parses this one",
+      "candidate": "corpus:expected",
+      "oracle": "corpus:reference"
+    },
+    {
+      "case": "bad-doctype-system",
+      "reason": "a DOCTYPE with a SYSTEM identifier is refused locally; Expat parses this one",
+      "candidate": "corpus:expected",
+      "oracle": "corpus:reference"
+    },
+    {
+      "case": "bad-doctype-entity",
+      "reason": "an internal entity declaration is refused locally; Expat expands it",
+      "candidate": "corpus:expected",
+      "oracle": "corpus:reference"
+    },
+    {
+      "case": "bad-doctype-external-pe",
+      "reason": "an external parameter entity is refused locally; Expat accepts the document without resolving it",
+      "candidate": "corpus:expected",
+      "oracle": "corpus:reference"
+    },
+    {
+      "case": "limit-input-over",
+      "reason": "8388609 input bytes exceed the local 8 MiB raw-input budget; the oracle has no such budget",
+      "candidate": "corpus:expected",
+      "oracle": "corpus:reference"
+    },
+    {
+      "case": "limit-token-over",
+      "reason": "1048577 decoded characters exceed the local 1 MiB token budget; the oracle has no such budget",
+      "candidate": "corpus:expected",
+      "oracle": "corpus:reference"
+    },
+    {
+      "case": "limit-decl-name-over",
+      "reason": "the declaration pseudo-attribute name exceeds the local token budget; the oracle reports XML_DECL",
+      "candidate": "corpus:expected",
+      "oracle": "corpus:reference"
+    },
+    {
+      "case": "limit-depth-over",
+      "reason": "257 open elements exceed the local 256-element nesting budget; the oracle has no nesting budget",
+      "candidate": "corpus:expected",
+      "oracle": "corpus:reference"
+    },
+    {
+      "case": "limit-expansion-over",
+      "reason": "1048577 predefined-reference characters exceed the local expansion budget; the oracle has no such budget",
+      "candidate": "corpus:expected",
+      "oracle": "corpus:reference"
+    }
+  ]
+}

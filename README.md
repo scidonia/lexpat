@@ -238,6 +238,52 @@ allocation failure is not claimed to be impossible; total parsing, the explicit
 stack and the absence of an entity resolver are what remove the usual
 unbounded-recursion and entity-amplification failure modes.
 
+## Security testing
+
+`docs/security.md` is the threat model: supported route, default budgets, the
+CVE-class disposition table, allocation-failure behavior, pointer and handle
+lifetime, and the limits of fuzzing and sanitizer evidence. The only verified
+integration route is the bounded C ABI, and it is not a drop-in replacement for
+libexpat outside that subset.
+
+A C-shim allocation failure during a callback now makes the same `XML_Parse`
+call return `XML_STATUS_ERROR` with `XML_GetErrorCode` equal to
+`XML_ERROR_NO_MEMORY` (1), not the generic malformed-wire code; a malformed
+internal frame still reports `XML_ERROR_MALFORMED_WIRE`. The public C scenario
+is `tests/c-abi-oom-contract.sh A3`, the direct-linked frame and allocation
+checks are `tests/c-abi-verify.py --wire`, and deterministic sanitizer-injected
+failures are `tests/security-oom-sanitized.sh`.
+
+The security set uses the flake-locked Clang/LLVM 21.1.8, Lean 4.35.0 and the
+pinned libexpat 2.8.5 oracle. `OUT` below is an absolute directory outside the
+checkout, created first:
+
+```sh
+OUT="$(mktemp -d "${TMPDIR:-/tmp}/lexpat-security.XXXXXX")"
+nix develop -c python3 tests/security-cve.py
+nix develop -c bash tests/security-differential-fixed.sh --out "$OUT/diff"
+nix develop -c bash tests/security-oom-sanitized.sh --out "$OUT/oom"
+nix develop -c bash tests/security-benchmark.sh --suite ci --out "$OUT/bench"
+nix develop -c bash tests/security-fuzz-smoke.sh --out "$OUT/fuzz"
+timeout --signal=TERM --kill-after=5s 300s \
+  nix develop -c bash tests/security-ci.sh --out "$OUT/ci"
+```
+
+`tests/security-fuzz-smoke.sh` runs the bounded parser, C ABI, shipped-artifact
+and in-process differential libFuzzer targets. The artifact target instruments
+only the harness, so its library coverage is explicitly absent; the parser and
+C ABI targets instrument the generated Lean C and the shim. The differential
+target links neither parser: it loads an instrumented candidate library and the
+pinned, uninstrumented oracle with `dlopen(..., RTLD_NOW | RTLD_LOCAL)` and
+calls each through its own `dlsym` table, requiring
+`pkg-config --modversion expat`, `XML_ExpatVersion()` and
+`XML_ExpatVersionInfo()` to be exactly `2.8.5` before comparing. The paired
+benchmark interleaves base and candidate readings and one-shot/chunked trials,
+and measures each case in a forked child so its recorded RSS belongs to that
+case. Long campaigns run through `tests/security-fuzz-campaign.sh` with an
+external output directory. Fuzzing is stochastic and bounded: a completed
+campaign is not a proof that the parser is free of bugs.
+
 ## Supported XML subset
 
 * XML declaration at the start of the document: `version="1.0"`, optional
@@ -314,7 +360,7 @@ trace must match, a mutated event field must be detected, and a flipped accept
 decision must be detected in both directions. See `docs/compatibility.md` for
 the mapping and the enumerated differences, and `AGENTS.md` for the test policy.
 
-`tests/c-abi-contract.sh` runs the two C-boundary scenarios in
+`tests/c-abi-contract.sh` runs the C-boundary scenarios in
 `tests/c-abi-contract.md` against the shipped header and shared object.
 `tests/c-abi-differential.py` compiles `tests/c-abi-client.c` twice — once
 against `include/expat.h` and `liblexpat.so.1`, once against the dev shell's

@@ -2,17 +2,18 @@
 # Reject admitted goals and non-total definitions in the Lean sources.
 #
 # Scope: every `.lean` file under `LexPat/` plus the top-level `LexPat.lean`
-# (the library, the proofs and the demonstration executable). The check is
-# textual and deliberately strict: it also rejects these words in comments, so
-# a source cannot discuss an escape hatch it does not use. An affirmative
-# control injects `sorry` into a temporary copy and requires the same scanner to
-# catch it, so a scanner that matches nothing cannot pass.
+# (the library, the proofs and the demonstration executable) and the test-only
+# `tests/FuzzParser.lean` entry point. The check is textual and deliberately
+# strict: it also rejects these words in comments, so a source cannot discuss an
+# escape hatch it does not use. An affirmative control injects `sorry` into a
+# temporary copy and requires the same scanner to catch it, so a scanner that
+# matches nothing cannot pass.
 set -euo pipefail
 
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 mapfile -t files < <(find "$repo/LexPat" -type f -name '*.lean' | sort)
-files+=("$repo/LexPat.lean")
+files+=("$repo/LexPat.lean" "$repo/tests/FuzzParser.lean")
 
 count=0
 for file in "${files[@]}"; do

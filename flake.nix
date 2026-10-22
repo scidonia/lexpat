@@ -56,7 +56,11 @@
 
           # The dev shell carries the Lean toolchain, a C compiler and `libexpat`'s
           # headers and library for the reference oracle, Python for the
-          # differential harness, and Valgrind for the release C memory check.
+          # differential harness, Valgrind for the release C memory check, and
+          # the Clang/LLVM release from the flake-locked nixpkgs for the
+          # libFuzzer security targets. A registry lookup would resolve a
+          # different nixpkgs revision, so the fuzz toolchain comes from the
+          # same `pkgs` set as everything else and `flake.lock` stays put.
           # `expat` is a test oracle only: neither the Lean library, its
           # executable nor the C ABI artifact links system libexpat.
           lexpatShell = pkgs.mkShell {
@@ -68,6 +72,8 @@
               pkgs.coreutils
               pkgs.zstd
               pkgs.stdenv.cc
+              pkgs.llvmPackages_21.clang
+              pkgs.llvmPackages_21.llvm
               pkgs.pkg-config
               pkgs.python3
               pkgs.valgrind
@@ -84,6 +90,17 @@
               # function inherited from the caller's environment would shadow
               # the toolchain binaries.
               unset -f lake lean
+              # The LLVM package puts its own `cc` shim on PATH. The checked-in
+              # C ABI build scripts select their compiler with `${CC:-cc}`, so
+              # keep the stdenv compiler first instead of letting LLVM become
+              # the production compiler.
+              export PATH="${pkgs.stdenv.cc}/bin:$PATH"
+              export CC="${pkgs.stdenv.cc}/bin/cc"
+              export CXX="${pkgs.stdenv.cc}/bin/c++"
+              # The security fuzz targets must build with the flake-locked
+              # LLVM 21.1.8, not the compiler Lean bundles and not a registry
+              # lookup. Scripts use this variable explicitly.
+              export CLANG="${pkgs.llvmPackages_21.clang}/bin/clang"
               export PKG_CONFIG_PATH="${pkgs.expat.dev}/lib/pkgconfig''${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
               # The version banner goes to stderr so that a command run with
               # `nix develop -c` keeps stdout machine-readable.

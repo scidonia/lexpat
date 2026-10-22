@@ -63,3 +63,11 @@ attribute arrays of `Event` values, which the rendered trace cannot observe.
 Not a default target. -/
 lean_exe lexpatEvents where
   root := `tests.StreamingEvents
+
+/-- The test-only raw-byte parser entry point that
+`tests/security/parser-fuzz.c` calls through `lexpat_fuzz_parse`. The module
+is type-checked like any other Lean source but is not part of the `LexPat`
+library, the default build or the C ABI artifact. -/
+lean_lib FuzzParser where
+  roots := #[`tests.FuzzParser]
+  globs := #[.one `tests.FuzzParser]

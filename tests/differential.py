@@ -404,6 +404,10 @@ def main():
 
         version = run([str(reference), "--version"]).stdout.strip()
         pkg_version = run(["pkg-config", "--modversion", "expat"]).stdout.strip()
+        if version != "expat_2.8.5" or pkg_version != "2.8.5":
+            raise HarnessError(
+                "the differential requires the pinned libexpat 2.8.5 reference; "
+                f"got {version} (pkg-config {pkg_version})")
         print(f"reference: {version} (pkg-config expat {pkg_version})")
         print(f"cases: {len(selected)} of {len(cases)} (groups: {', '.join(groups)})")
 

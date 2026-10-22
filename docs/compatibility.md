@@ -145,9 +145,14 @@ documents.
 
 ## Intentional differences
 
-These are asserted by `tests/corpus/cases.json` as `exception` rows: the Lean
-outcome and the oracle outcome are both checked against their declared values,
-and the row fails if they stop differing.
+Most of these are asserted by `tests/corpus/cases.json` as `exception` rows: the
+Lean outcome and the oracle outcome are both checked against their declared
+values, and the row fails if they stop differing. The truncated-surrogate
+bullet and the encoding-label list are documented behavior rather than separate
+exception rows: the corpus uses a surrogate placement where both parsers reject
+with `INVALID_TOKEN`, and the recognized labels are exercised by the
+`encoding-attack` rows. `tests/security/differential-exceptions.json` accounts
+for all twelve actual exception rows.
 
 * **Every DOCTYPE is refused.** The parser rejects `<!DOCTYPE ...` as
   `UNSUPPORTED_DTD` before reading any declaration, internal subset, system
@@ -157,7 +162,11 @@ and the row fails if they stop differing.
   resolver, no identifier read.
 * **Resource budgets.** Expat has no configurable input, token, nesting or
   reference-expansion budget, so inputs that lexpat rejects with a `LIMIT_*`
-  code are accepted by the oracle. The exact-boundary rows are accepted by both.
+  code are accepted by the oracle, with the declaration-token pair as the
+  declared exception. The over-budget declaration name is `LIMIT_TOKEN` locally
+  but `XML_DECL` on the oracle (`limit-decl-name-over`, an exception row); the
+  exact-boundary declaration name is `XML_DECL` on both
+  (`limit-decl-name-exact`). The other exact-boundary rows are accepted by both.
 * **A BOM contradicted by the declaration is rejected.** A UTF-8 BOM followed by
   `encoding="ISO-8859-1"` is `INCORRECT_ENCODING`; Expat accepts the declaration
   and decodes as UTF-8.
