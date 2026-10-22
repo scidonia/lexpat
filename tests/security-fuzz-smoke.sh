@@ -61,12 +61,13 @@ if [ -z "$build_dir" ]; then
   build_dir="$out/build"
   bash "$repo/scripts/security-fuzz-build.sh" --out "$build_dir"
 fi
-for binary in parser-fuzz cabi-fuzz artifact-fuzz differential-fuzz; do
-  if [ ! -x "$build_dir/$binary" ]; then
-    echo "security-fuzz-smoke: missing $build_dir/$binary" >&2
-    exit 1
-  fi
-done
+# The prepared build is accepted only when its content manifests, toolchain and
+# oracle identities and every named target hash match this checkout. A failed
+# validation cannot become a green fuzz count.
+python3 "$repo/scripts/security-fuzz-verify.py" --build-dir "$build_dir" || {
+  echo "security-fuzz-smoke: prepared build refused" >&2
+  exit 1
+}
 
 export ASAN_OPTIONS="detect_leaks=0:quarantine_size_mb=16:abort_on_error=1"
 export UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1"

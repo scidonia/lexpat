@@ -37,14 +37,48 @@ jobs:
       - name: C ABI callback allocation contract A3
         run: nix develop -c bash tests/c-abi-oom-contract.sh A3
 
+      # The fuzz targets are prepared in their own capped step so a cold build
+      # fails here, with its log retained, instead of consuming the security
+      # budget or hiding behind it.
+      - name: prepare the fuzz build
+        timeout-minutes: 15
+        run: |
+          mkdir -p "$RUNNER_TEMP/lexpat-fuzz-build"
+          set -o pipefail
+          nix develop -c bash scripts/security-fuzz-build.sh \
+            --out "$RUNNER_TEMP/lexpat-fuzz-build" \
+            2>&1 | tee "$RUNNER_TEMP/lexpat-fuzz-build/build.log"
+
       # One step covers CVE checks, the fixed differential replay, injected
       # shim OOM, the benchmark smoke and the four-target fuzz smoke. The
-      # outer cap starts before Nix shell evaluation.
+      # wrapper runs outside Nix, so its 300-second deadline includes Nix
+      # startup, and it kills and reaps the whole process group on timeout.
+      # Each stage keeps its own log under the stages directory.
       - name: bounded security checks
         run: |
-          security_out="$(mktemp -d "${RUNNER_TEMP:-/tmp}/lexpat-security.XXXXXX")"
-          timeout --signal=TERM --kill-after=5s 300s \
-            nix develop -c bash tests/security-ci.sh --out "$security_out"
+          mkdir -p "$RUNNER_TEMP/lexpat-security"
+          python3 scripts/run-bounded-security.py \
+            --seconds 300 --grace 5 \
+            --log "$RUNNER_TEMP/lexpat-security/bounded.log" \
+            -- nix develop -c bash tests/security-ci.sh \
+                 --out "$RUNNER_TEMP/lexpat-security/stages" \
+                 --build-dir "$RUNNER_TEMP/lexpat-fuzz-build"
+
+      # Reached when preparation or the security step fails. The preparation
+      # log is required; the wrapper log exists once the bounded step started.
+      - name: upload security diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lexpat-security-diagnostics
+          if-no-files-found: error
+          path: |
+            ${{ runner.temp }}/lexpat-fuzz-build/build.log
+            ${{ runner.temp }}/lexpat-fuzz-build/build.json
+            ${{ runner.temp }}/lexpat-fuzz-build/source-manifest.sha256
+            ${{ runner.temp }}/lexpat-fuzz-build/targets.sha256
+            ${{ runner.temp }}/lexpat-security/bounded.log
+            ${{ runner.temp }}/lexpat-security/stages/**/*.log
 
       - name: C ABI differential against libexpat
         run: nix develop -c python3 tests/c-abi-differential.py
@@ -54,6 +88,15 @@ jobs:
 
       - name: C ABI memory checks
         run: nix develop -c bash tests/c-abi-memory.sh
+
+      # Correctness-only smoke: preflight, drift and small samples. Throughput
+      # thresholds are never enforced on shared runners.
+      - name: performance benchmark smoke
+        run: |
+          nix develop -c bash tests/performance-benchmark.sh \
+            --candidate-source "$GITHUB_WORKSPACE" \
+            --out "$RUNNER_TEMP/lexpat-performance-smoke" \
+            --phase smoke --samples 3 --warmups 1 --chunk 4096
 
       - name: one-shot fault precedence contract
         run: nix develop -c lake env lean --run tests/OneShotPrecedence.lean

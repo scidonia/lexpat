@@ -303,10 +303,19 @@ def testTerminalAndState : IO Unit := do
   let (st, evs) := Stream.feed (Stream.new {}) "<a>text<b/>rest".toUTF8
   expectEvents "bounded-prefix" evs
     #[.start "a" #[], .text "text", .start "b" #[], .end "b"]
-  if st.buf.size != 4 then fail s!"bounded: buf size {st.buf.size}"
-  if String.ofList st.buf.toList != "rest" then
-    fail s!"bounded: buf is {repr (String.ofList st.buf.toList)}"
-  if st.stack.size != 1 then fail "bounded: unexpected stack"
+  -- The unfinished text token is the only carried lexical state: it holds the
+  -- four bytes of `rest`, holds no reference to the fed chunk, and stays inside
+  -- the token ceiling.
+  let carry := st.textPieces.foldl (fun acc piece => acc.append piece) ByteArray.empty
+  if carry.size != 4 then fail s!"bounded: carry size {carry.size}"
+  if String.fromUTF8! carry != "rest" then
+    fail s!"bounded: carry is {repr (String.fromUTF8! carry)}"
+  if st.textChars != 4 then fail s!"bounded: carry char count {st.textChars}"
+  if carry.size > st.limits.maxTokenChars then
+    fail "bounded: carry exceeds the token ceiling"
+  if !st.buf.isEmpty then fail "bounded: character buffer retained text"
+  if st.stack.length != 1 then fail "bounded: unexpected stack"
+  if st.depth != 1 then fail "bounded: depth disagrees with the stack"
   if st.pending.size != 0 then fail "bounded: pending decoder bytes retained"
   if st.rawConsumed != "<a>text<b/>rest".toUTF8.size then
     fail "bounded: byte counter"
@@ -557,6 +566,90 @@ def testDeclNonAsciiField : IO Unit := do
   expectError "decl-nonascii-outside-finish" (resultOf outsideDone)
     .partialChar "truncated"
 
+/-! ### The token ceiling costs the same at and past the limit -/
+
+/-- `n` copies of `b`, for the near-ceiling documents below. -/
+def repeatByte (n : Nat) (b : Nat) : ByteArray :=
+  ByteArray.mk (Array.replicate n (UInt8.ofNat b))
+
+/-- Feed `bs` in `size`-byte chunks, asserting after every feed that no
+unfinished token and no carried start-tag prefix holds more than its bound. -/
+def feedChunksBounded (limits : Limits) (bs : ByteArray) (size : Nat) :
+    Stream × Array Event :=
+  Id.run do
+    let mut st := Stream.new limits
+    let mut acc : Array Event := #[]
+    let mut i := 0
+    while i < bs.size do
+      let (st1, es) := Stream.feed st (bs.extract i (Nat.min bs.size (i + size)))
+      st := st1
+      for e in es do acc := acc.push e
+      i := i + size
+    return (st, acc)
+
+def expectBoundedCarry (label : String) (st : Stream) : IO Unit := do
+  if st.pending.size > 4 then
+    fail s!"{label}: pending holds {st.pending.size} bytes"
+  if st.tagCarry.size > 64 * 1024 then
+    fail s!"{label}: the carried start-tag prefix holds {st.tagCarry.size} bytes"
+
+/-- A body of exactly `n` characters is accepted and one more is refused with
+`LIMIT_TOKEN` at the offset of the first character past the budget, for the
+element name, character data, attribute name and attribute value families,
+whole and split into 4096-byte feeds. The whole-input and split results are
+compared with each other as well as with the derived offset, so a fast path may
+not change the fault or its cost. -/
+def testTokenCeiling : IO Unit := do
+  let limits : Limits := {}
+  let n := limits.maxTokenChars
+  -- (label, document for `k` payload bytes, payload start offset, events check)
+  let families : List (String × (Nat → ByteArray) × Nat) :=
+    [("name", fun k => bytes [0x3C] ++ repeatByte k 0x61 ++ bytes [0x2F, 0x3E], 1),
+     ("text", fun k => bytes [0x3C, 0x72, 0x3E] ++ repeatByte k 0x78 ++
+        bytes [0x3C, 0x2F, 0x72, 0x3E], 3),
+     ("attr-name", fun k => bytes [0x3C, 0x72, 0x20] ++ repeatByte k 0x61 ++
+        bytes [0x3D, 0x22, 0x76, 0x22, 0x2F, 0x3E], 3),
+     ("attr-value", fun k => bytes [0x3C, 0x72, 0x20, 0x61, 0x3D, 0x22] ++
+        repeatByte k 0x76 ++ bytes [0x22, 0x2F, 0x3E], 6)]
+  for (label, document, start) in families do
+    -- Exactly at the ceiling: accepted, whole and in 4096-byte feeds.
+    let exact := document n
+    let whole := parseDocument exact limits
+    match whole with
+    | .ok _ => pure ()
+    | .error e => fail s!"{label}-exact: refused with {e.code.name}/{e.reason} at {e.offset}"
+    let (stExact, evsExact) := feedChunksBounded limits exact 4096
+    let (stExactDone, evsExact2) := Stream.finish stExact
+    match Stream.result stExactDone with
+    | some (.ok ()) => pure ()
+    | _ => fail s!"{label}-exact-chunked: the document did not complete"
+    if evsExact ++ evsExact2 != (match whole with | .ok evs => evs | .error _ => #[]) then
+      fail s!"{label}-exact-chunked: events differ from the whole-input parse"
+
+    -- One past the ceiling: refused at the first character past the budget.
+    let over := document (n + 1)
+    let want := start + n
+    match parseDocument over with
+    | .error e =>
+      if e.code != .limitToken || e.reason != "limitToken" || e.offset != want then
+        fail s!"{label}-over: got {e.code.name}/{e.reason} at {e.offset}, \
+          expected LIMIT_TOKEN/limitToken at {want}"
+    | .ok _ => fail s!"{label}-over: accepted a token past the ceiling"
+
+    -- The same fault, the same offset and a bounded carry when the document
+    -- arrives in 4096-byte feeds: the scanner must not rescan the token it
+    -- already knows cannot fit.
+    let (stOver, _) := feedChunksBounded limits over 4096
+    expectBoundedCarry s!"{label}-over-chunked" stOver
+    let (stOverDone, _) := Stream.finish stOver
+    match Stream.result stOverDone with
+    | some (.error e) =>
+      if e.code != .limitToken || e.reason != "limitToken" || e.offset != want then
+        fail s!"{label}-over-chunked: got {e.code.name}/{e.reason} at {e.offset}, \
+          expected LIMIT_TOKEN/limitToken at {want}"
+    | some (.ok ()) => fail s!"{label}-over-chunked: accepted a token past the ceiling"
+    | none => fail s!"{label}-over-chunked: the stream did not finish"
+
 def runAll : IO Unit := do
   testEncodings
   testUtf8Scalars
@@ -570,6 +663,7 @@ def runAll : IO Unit := do
   testTokenBoundaries
   testDeclFaultPrecedence
   testDeclNonAsciiField
+  testTokenCeiling
   IO.println "StreamingCases: all direct stream assertions passed"
 
 end LexPat.StreamingCases

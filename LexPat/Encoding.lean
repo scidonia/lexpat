@@ -13,7 +13,7 @@ declaration may name ISO-8859-1 or US-ASCII. A declaration can never
 contradict the byte evidence: the document parser re-checks the declaration's
 `encoding` value against the encoding actually used. `LexPat.Stream` performs
 this decision once, from a bounded undecided prefix, and reuses the decoders
-and the declaration-label scanner here; `detectSignature`,
+and the byte-index declaration-label scanner here; `detectSignature`,
 `scanDeclLabel` and the per-scalar decoders are the pieces it shares.
 -/
 import LexPat.Types
@@ -233,21 +233,6 @@ def decodeUtf16One (data : ByteArray) (bigEndian : Bool) (i : Nat) :
           i + 2)
   | _, _ => .error ⟨.oddUtf16Length, i⟩
 
-/-- Decode `[start, stop)` as ISO-8859-1: every byte is the scalar of its value. -/
-def decodeLatin1Range (data : ByteArray) (start stop : Nat) : Array DecodedChar :=
-  Id.run do
-    let mut i := start
-    let mut acc : Array DecodedChar := #[]
-    while i < stop ∧ i < data.size do
-      match data[i]? with
-      | some b =>
-        acc := acc.push ⟨⟨b.toNat, Or.inl (by
-            have hb : b.toNat < 256 := UInt8.toNat_lt b
-            omega)⟩, i⟩
-      | none => pure ()
-      i := i + 1
-    return acc
-
 /-- Encoding names we recognize, before checking them against the byte
 evidence. -/
 inductive LabelKind where
@@ -314,8 +299,7 @@ def findDeclEnd (data : ByteArray) (limit : Nat) : Nat :=
 document opens with an XML declaration inside the scan limit. -/
 def scanDeclLabel (data : ByteArray) (limit : Nat) : Option String :=
   if startsWithDeclOpen data then
-    let stop := findDeclEnd data limit
-    LexPat.scanDeclEncodingLabel (decodeLatin1Range data 0 stop)
+    LexPat.scanDeclEncodingLabel data (findDeclEnd data limit)
   else
     none
 

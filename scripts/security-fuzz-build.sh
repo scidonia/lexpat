@@ -183,31 +183,111 @@ candidate_define="-DLEX_DEFAULT_CANDIDATE=\"$candidate_diff\""
   -L"$repo/.lake/build/lib" -llexpat \
   -Wl,-rpath,"$repo/.lake/build/lib" -o "$out/artifact-fuzz"
 
-# Record the environment and the exact inputs of this build.
+# Record the environment and the exact inputs of this build. Every path in
+# both manifests is repository- or build-relative and sorted, so the consumer
+# can recompute the same set from its own checkout and refuse a stale build.
 source_manifest="$out/source-manifest.sha256"
-: >"$source_manifest"
+targets_manifest="$out/targets.sha256"
+shipped_artifact="$repo/.lake/build/lib/liblexpat.so.1"
+
+if [ ! -f "$shipped_artifact" ]; then
+  echo "security-fuzz-build: missing shipped artifact $shipped_artifact" >&2
+  exit 1
+fi
+
+relative() {
+  realpath --relative-to="$repo" "$1"
+}
+
 {
-  for source in "${sources[@]}"; do
-    sha256sum -- "$source"
+  {
+    find "$repo/LexPat" -name '*.lean' -type f
+    printf '%s\n' "$repo/LexPat.lean" "$repo/tests/FuzzParser.lean" \
+      "$repo/lakefile.lean" "$repo/lake-manifest.json" "$repo/lean-toolchain" \
+      "$repo/flake.nix" "$repo/flake.lock" "$repo/cabi/expat.c" \
+      "$repo/cabi/exports.map" "$repo/include/expat.h" \
+      "$repo/tests/security/parser-fuzz.c" "$repo/tests/security/cabi-fuzz.c" \
+      "$repo/tests/security/differential.c" \
+      "$repo/scripts/security-fuzz-build.sh" "$shipped_artifact"
+    for source in "${sources[@]}"; do
+      case "$source" in
+        */.lake/build/ir/*) printf '%s\n' "$source" ;;
+      esac
+    done
+  } | while IFS= read -r path; do
+    if [ ! -f "$path" ]; then
+      echo "security-fuzz-build: build input missing: $path" >&2
+      exit 1
+    fi
+    printf '%s  %s\n' "$(sha256sum -- "$path" | cut -d' ' -f1)" "$(relative "$path")"
+  done | LC_ALL=C sort -k2
+} >"$source_manifest"
+
+target_names=(parser-fuzz cabi-fuzz artifact-fuzz differential-fuzz
+              differential-replay liblexpat-diff.so)
+{
+  for name in "${target_names[@]}"; do
+    target="$out/$name"
+    if [ ! -f "$target" ]; then
+      echo "security-fuzz-build: target missing: $target" >&2
+      exit 1
+    fi
+    printf '%s  %s\n' "$(sha256sum -- "$target" | cut -d' ' -f1)" "$name"
   done
-  sha256sum -- "$repo/tests/security/parser-fuzz.c" \
-    "$repo/tests/security/cabi-fuzz.c" \
-    "$repo/tests/security/differential.c" \
-    "$repo/tests/FuzzParser.lean" \
-    "$repo/scripts/security-fuzz-build.sh"
-} >>"$source_manifest"
+} | LC_ALL=C sort -k2 >"$targets_manifest"
+
+clang_path="$(command -v "$clang")"
+lean_path="$(command -v lean)"
+clang_version="$("$clang" --version | head -n 1)"
+lean_version="$(lean --version | head -n 1)"
 
 {
   printf '{\n'
-  printf '  "format": 1,\n'
+  printf '  "format": 2,\n'
   printf '  "revision": "%s",\n' "$(git -C "$repo" rev-parse HEAD)"
-  printf '  "dirty": "%s",\n' \
+  printf '  "dirty_digest": "%s",\n' \
     "$(git -C "$repo" status --porcelain | sha256sum | cut -d' ' -f1)"
-  printf '  "clang": "%s",\n' "$("$clang" --version | head -n 1)"
-  printf '  "lean": "%s",\n' "$(lean --version | head -n 1)"
-  printf '  "expat": "%s",\n' "$(pkg-config --modversion expat)"
+  printf '  "source_manifest": "source-manifest.sha256",\n'
   printf '  "source_manifest_sha256": "%s",\n' \
     "$(sha256sum "$source_manifest" | cut -d' ' -f1)"
+  printf '  "targets_manifest": "targets.sha256",\n'
+  printf '  "targets_manifest_sha256": "%s",\n' \
+    "$(sha256sum "$targets_manifest" | cut -d' ' -f1)"
+  printf '  "toolchain": {\n'
+  printf '    "clang": {"path": "%s", "version": "%s", "sha256": "%s"},\n' \
+    "$clang_path" "$clang_version" "$(sha256sum "$clang_path" | cut -d' ' -f1)"
+  printf '    "lean": {"path": "%s", "version": "%s", "sha256": "%s"},\n' \
+    "$lean_path" "$lean_version" "$(sha256sum "$lean_path" | cut -d' ' -f1)"
+  printf '    "compile_flags": "-std=gnu11 -O1 -g -fno-omit-frame-pointer -fsanitize=fuzzer-no-link,address,undefined -DLEAN_EXPORTING -fPIC",\n'
+  printf '    "sanitize_flags": "-fsanitize=fuzzer,address,undefined -fno-omit-frame-pointer",\n'
+  printf '    "lean_link_flags": "-L<lean --print-libdir> -lleanshared -pthread",\n'
+  printf '    "version_script": "cabi/exports.map"\n'
+  printf '  },\n'
+  printf '  "oracle": {\n'
+  printf '    "pkg_config_version": "%s",\n' "$pkg_version"
+  printf '    "path": "%s",\n' "$oracle"
+  printf '    "sha256": "%s",\n' "$(sha256sum "$oracle" | cut -d' ' -f1)"
+  printf '    "version": "%s",\n' \
+    "$(sed -n 's/^oracle=//p' "$out/differential-oracle.txt")"
+  printf '    "version_info": "%s"\n' \
+    "$(sed -n 's/^oracle_info=//p' "$out/differential-oracle.txt")"
+  printf '  },\n'
+  printf '  "shipped_artifact": {"path": "%s", "sha256": "%s"},\n' \
+    "$(relative "$shipped_artifact")" \
+    "$(sha256sum "$shipped_artifact" | cut -d' ' -f1)"
+  printf '  "targets": [\n'
+  first=1
+  for name in "${target_names[@]}"; do
+    kind="executable"
+    case "$name" in
+      *.so) kind="shared" ;;
+    esac
+    if [ "$first" -eq 0 ]; then printf ',\n'; fi
+    first=0
+    printf '    {"name": "%s", "kind": "%s", "sha256": "%s"}' \
+      "$name" "$kind" "$(sha256sum "$out/$name" | cut -d' ' -f1)"
+  done
+  printf '\n  ],\n'
   printf '  "instrumented_sources": %s,\n' "${#sources[@]}"
   printf '  "differential_topology": "dlopen RTLD_NOW|RTLD_LOCAL candidate and oracle; separate dlsym tables; neither parser linked into the fuzzer",\n'
   printf '  "differential_candidate": "liblexpat-diff.so",\n'
@@ -220,3 +300,5 @@ source_manifest="$out/source-manifest.sha256"
 echo "security-fuzz-build: wrote parser-fuzz, cabi-fuzz, artifact-fuzz,"
 echo "security-fuzz-build: liblexpat-diff.so, differential-fuzz and"
 echo "security-fuzz-build: differential-replay under $out"
+echo "security-fuzz-build: wrote build.json, source-manifest.sha256 and"
+echo "security-fuzz-build: targets.sha256 with repo-relative, hashed inputs"

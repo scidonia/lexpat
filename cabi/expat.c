@@ -2,8 +2,8 @@
  * The C half of the liblexpat.so.1 artifact.
  *
  * This file owns the opaque parser handle, the handle registry, the Lean
- * runtime entry points, the version-1 event-frame decoder and the dispatch to
- * the handlers a client registered. It is compiled with hidden visibility and
+ * runtime entry points, the direct event receivers and the dispatch to the
+ * handlers a client registered. It is compiled with hidden visibility and
  * linked against the Lean module objects; the version script publishes only
  * the XML_* manifest.
  *
@@ -25,9 +25,10 @@
 
 /* The C ABI artifact's maximum input, matching LexPat.Limits.maxInputBytes. */
 #define LEXPAT_MAX_INPUT ((size_t)(8 * 1024 * 1024))
-/* The maximum event frame, matching LexPat.CAbi.maxFrameBytes. */
-#define LEXPAT_MAX_FRAME ((size_t)(16 * 1024 * 1024))
-#define LEXPAT_WIRE_HEADER 44u
+/* The maximum logical event payload the receiver copies or borrows in one
+ * callback: the same 16 MiB ceiling the serialized frame enforced, applied to
+ * one event's bytes. */
+#define LEXPAT_MAX_PAYLOAD ((size_t)(16 * 1024 * 1024))
 
 /* Lean bridge exports and receiver externals. The receiver symbols are
  * defined in this file; the module initialiser and stream exports come from
@@ -37,8 +38,31 @@ extern lean_object *lexpat_cabi_stream_new(uint64_t hint);
 extern lean_object *lexpat_cabi_stream_feed(lean_object *stream, lean_object *bytes);
 extern lean_object *lexpat_cabi_stream_finish(lean_object *stream);
 
-uint64_t lexpat_cabi_emit_frame(lean_object *frame);
-uint64_t lexpat_cabi_reject_frame(uint64_t size);
+uint64_t lexpat_cabi_emit_xml_decl(lean_object *version, lean_object *encoding,
+                                   uint8_t has_encoding, int64_t standalone,
+                                   uint64_t offset, uint64_t line, uint64_t column);
+uint64_t lexpat_cabi_emit_start(lean_object *name, lean_object *attrs, uint64_t offset,
+                                uint64_t line, uint64_t column);
+uint64_t lexpat_cabi_emit_start_slice(lean_object *owner, uint64_t name_start,
+                                     uint64_t name_stop, uint64_t base,
+                                     lean_object *ranges, uint64_t offset,
+                                     uint64_t line, uint64_t column);
+uint64_t lexpat_cabi_emit_end(lean_object *name, uint64_t offset, uint64_t line,
+                              uint64_t column);
+uint64_t lexpat_cabi_emit_end_slice(lean_object *owner, uint64_t name_start,
+                                    uint64_t name_stop, uint64_t base,
+                                    uint64_t offset, uint64_t line, uint64_t column);
+uint64_t lexpat_cabi_emit_text(lean_object *owner, uint64_t start, uint64_t stop,
+                               uint64_t base, uint64_t offset, uint64_t line,
+                               uint64_t column);
+uint64_t lexpat_cabi_emit_text_string(lean_object *data, uint64_t offset,
+                                      uint64_t line, uint64_t column);
+uint64_t lexpat_cabi_emit_cdata_start(uint64_t offset, uint64_t line, uint64_t column);
+uint64_t lexpat_cabi_emit_cdata_end(uint64_t offset, uint64_t line, uint64_t column);
+uint64_t lexpat_cabi_emit_comment(lean_object *data, uint64_t offset, uint64_t line,
+                                  uint64_t column);
+uint64_t lexpat_cabi_emit_pi(lean_object *target, lean_object *data, uint64_t offset,
+                             uint64_t line, uint64_t column);
 uint64_t lexpat_cabi_report_status(uint64_t status, uint64_t code, uint64_t offset,
                                    uint64_t line, uint64_t column,
                                    uint64_t raw_consumed);
@@ -256,52 +280,21 @@ static enum XML_Error errorFromIndex(uint64_t index) {
 }
 
 /* -------------------------------------------------------------------------
- * Version-1 event frame decoding.
+ * Direct event receivers.
+ *
+ * One callback-specific function per event kind. A receiver validates the
+ * location, the payload bounds and the ordered attribute table before it
+ * allocates or invokes a handler, sets the current position even when no
+ * handler is installed, and allocates payload storage only for a handler that
+ * exists. A failed allocation is XML_ERROR_NO_MEMORY; malformed metadata is
+ * XML_ERROR_MALFORMED_WIRE, raised before any handler runs.
+ *
+ * Strings are copied into NUL-terminated storage that lives for the duration
+ * of the synchronous callback. Literal character data borrows the Lean array
+ * that owns the fed chunk and passes an explicit length; nothing is copied.
  * ---------------------------------------------------------------------- */
 
-typedef struct Reader {
-  const unsigned char *bytes;
-  size_t size;
-  size_t pos;
-} Reader;
-
-static int readBytes(Reader *reader, const unsigned char **out, size_t length) {
-  if (length > reader->size - reader->pos)
-    return 0;
-  *out = reader->bytes + reader->pos;
-  reader->pos += length;
-  return 1;
-}
-
-static int readU8(Reader *reader, uint8_t *out) {
-  const unsigned char *bytes;
-  if (!readBytes(reader, &bytes, 1))
-    return 0;
-  *out = bytes[0];
-  return 1;
-}
-
-static int readU32(Reader *reader, uint32_t *out) {
-  const unsigned char *bytes;
-  if (!readBytes(reader, &bytes, 4))
-    return 0;
-  *out = (uint32_t)bytes[0] | ((uint32_t)bytes[1] << 8) |
-         ((uint32_t)bytes[2] << 16) | ((uint32_t)bytes[3] << 24);
-  return 1;
-}
-
-static int readU64(Reader *reader, uint64_t *out) {
-  const unsigned char *bytes;
-  if (!readBytes(reader, &bytes, 8))
-    return 0;
-  *out = (uint64_t)bytes[0] | ((uint64_t)bytes[1] << 8) | ((uint64_t)bytes[2] << 16) |
-         ((uint64_t)bytes[3] << 24) | ((uint64_t)bytes[4] << 32) |
-         ((uint64_t)bytes[5] << 40) | ((uint64_t)bytes[6] << 48) |
-         ((uint64_t)bytes[7] << 56);
-  return 1;
-}
-
-/* XML forbids NUL inside a name or character value, and the payload must be
+/* XML forbids NUL inside a name or character value, and a payload must be
  * well-formed UTF-8 before it is handed to a C string callback. */
 static int validUtf8(const unsigned char *bytes, size_t size) {
   size_t i = 0;
@@ -347,339 +340,625 @@ static int validUtf8(const unsigned char *bytes, size_t size) {
   return 1;
 }
 
-typedef struct WireString {
-  const unsigned char *bytes;
-  uint32_t length;
-} WireString;
-
-static int readString(Reader *reader, WireString *out) {
-  uint32_t length;
-  if (!readU32(reader, &length))
-    return 0;
-  if (!readBytes(reader, &out->bytes, (size_t)length))
-    return 0;
-  out->length = length;
-  return validUtf8(out->bytes, (size_t)length);
-}
-
-static char *copyString(WireString value) {
-  char *copy = (char *)malloc((size_t)value.length + 1);
-  if (copy == NULL)
-    return NULL;
-  if (value.length > 0)
-    memcpy(copy, value.bytes, value.length);
-  copy[value.length] = '\0';
-  return copy;
-}
-
 static void beginCallback(XML_Parser parser) { parser->inCallback = 1; }
 static void endCallback(XML_Parser parser) { parser->inCallback = 0; }
 
-/* `allocationFailed` distinguishes an exhausted C allocation from a frame the
- * payload does not describe: both return 0, but only the former is
- * `XML_ERROR_NO_MEMORY`. */
-static int dispatchStart(XML_Parser parser, WireString name, Reader *payload,
-                         uint32_t expectedPairs, int *allocationFailed) {
-  uint32_t pairs;
-  if (!readU32(payload, &pairs) || pairs != expectedPairs)
-    return 0;
-  if (pairs > (UINT32_MAX - 1) / 2)
-    return 0;
-  /* Every pair carries a 32-bit name length, the name, a 32-bit value length
-   * and the value, so it occupies at least eight payload bytes. A count the
-   * remaining payload cannot describe is malformed; reject it before sizing
-   * the vector it would have requested. */
-  if (payload->pos > payload->size ||
-      pairs > (payload->size - payload->pos) / 8)
-    return 0;
+/* Byte length of a Lean string. `lean_string_size` counts the bytes including
+ * the terminating NUL, while `lean_string_len` counts UTF-8 characters; every
+ * payload bound and copy here is in bytes. */
+static size_t stringBytes(lean_object *value) { return lean_string_size(value) - 1; }
 
-  /* A parser without a start handler still validates the frame, but nothing
-   * consumes copies of the name or the attribute vector. */
-  if (parser->startHandler == NULL) {
-    for (uint32_t i = 0; i < pairs; i++) {
-      WireString attrName;
-      WireString attrValue;
-      if (!readString(payload, &attrName) || !readString(payload, &attrValue))
-        return 0;
-    }
-    return payload->pos == payload->size;
-  }
-
-  char *elementName = copyString(name);
-  if (elementName == NULL) {
-    *allocationFailed = 1;
-    return 0;
-  }
-
-  size_t slots = (size_t)pairs * 2 + 1;
-  char **atts = (char **)calloc(slots, sizeof(char *));
-  if (atts == NULL) {
-    free(elementName);
-    *allocationFailed = 1;
-    return 0;
-  }
-
-  int ok = 1;
-  for (uint32_t i = 0; i < pairs && ok; i++) {
-    WireString attrName;
-    WireString attrValue;
-    if (!readString(payload, &attrName) || !readString(payload, &attrValue)) {
-      ok = 0;
-      break;
-    }
-    atts[i * 2] = copyString(attrName);
-    atts[i * 2 + 1] = copyString(attrValue);
-    if (atts[i * 2] == NULL || atts[i * 2 + 1] == NULL) {
-      ok = 0;
-      *allocationFailed = 1;
-    }
-  }
-  atts[slots - 1] = NULL;
-
-  if (ok && payload->pos != payload->size)
-    ok = 0;
-
-  if (ok && parser->startHandler != NULL) {
-    parser->specifiedAttrs = (int)(pairs * 2);
-    beginCallback(parser);
-    parser->startHandler(parser->userData, elementName, (const XML_Char **)atts);
-    endCallback(parser);
-    parser->specifiedAttrs = 0;
-  }
-
-  for (size_t i = 0; i < slots; i++)
-    free(atts[i]);
-  free(atts);
-  free(elementName);
-  return ok;
-}
-
-static int dispatchWire(XML_Parser parser, const unsigned char *bytes, size_t size,
-                        int *allocationFailed) {
-  Reader reader = {bytes, size, 0};
-  const unsigned char *magic;
-  uint8_t version;
-  uint8_t tag;
-  uint8_t reserved0;
-  uint8_t reserved1;
-  uint32_t length;
-  uint64_t offset;
-  uint64_t line;
-  uint64_t column;
-  uint32_t tokenBytes;
-  uint32_t attributePairs;
-
-  if (size < LEXPAT_WIRE_HEADER || size > LEXPAT_MAX_FRAME)
-    return 0;
-  if (!readBytes(&reader, &magic, 4) || magic[0] != 'L' || magic[1] != 'X' ||
-      magic[2] != 'E' || magic[3] != 'V')
-    return 0;
-  if (!readU8(&reader, &version) || version != 1)
-    return 0;
-  if (!readU8(&reader, &tag) || tag > 7)
-    return 0;
-  if (!readU8(&reader, &reserved0) || !readU8(&reader, &reserved1) ||
-      reserved0 != 0 || reserved1 != 0)
-    return 0;
-  if (!readU32(&reader, &length) || length != size)
-    return 0;
-  /* Every frame describes a position in the bytes actually handed to this
-   * parser. An opener at or beyond `fed` has not been fed, a line cannot pass
-   * the byte count, and a column is a scalar offset on its line. */
+/* Record the current position. Every receiver calls this first, so a handler
+ * that queries the position sees the event's own coordinates even when no
+ * other handler is installed. */
+static int setPosition(XML_Parser parser, uint64_t offset, uint64_t line,
+                       uint64_t column) {
   const uint64_t fed = (uint64_t)parser->fedEnd;
-  if (!readU64(&reader, &offset) || offset >= fed)
+  if (offset >= fed)
     return 0;
-  if (!readU64(&reader, &line) || line < 1 || line > fed + 1)
+  if (line < 1 || line > fed + 1)
     return 0;
-  if (!readU64(&reader, &column) || column > fed)
+  if (column > fed)
     return 0;
-  if (!readU32(&reader, &tokenBytes))
-    return 0;
-  if (!readU32(&reader, &attributePairs))
-    return 0;
-  /* A text event reports no span; every markup token reports the non-empty
-   * span from its opener through the last byte it consumed. */
-  if (tag == 3 ? tokenBytes != UINT32_MAX
-               : tokenBytes == 0 || tokenBytes == UINT32_MAX ||
-                     (uint64_t)tokenBytes > fed - offset)
-    return 0;
-  if (tag != 1 && attributePairs != 0)
-    return 0;
-
-  /* Every frame updates the current position, even when no handler is set. */
   parser->byteIndex = (XML_Index)offset;
   parser->line = (XML_Size)line;
   parser->column = (XML_Size)column;
-
-  switch (tag) {
-  case 0: { /* XML declaration */
-    WireString versionString;
-    WireString encodingString;
-    uint8_t presence;
-    uint8_t standalone;
-    if (!readString(&reader, &versionString) || !readU8(&reader, &presence) ||
-        presence > 1)
-      return 0;
-    int haveEncoding = presence == 1;
-    if (haveEncoding && !readString(&reader, &encodingString))
-      return 0;
-    if (!readU8(&reader, &standalone))
-      return 0;
-    if (standalone != 0xFF && standalone != 0 && standalone != 1)
-      return 0;
-    if (reader.pos != reader.size)
-      return 0;
-    if (parser->xmlDeclHandler == NULL)
-      return 1;
-    char *versionCopy = copyString(versionString);
-    char *encodingCopy = haveEncoding ? copyString(encodingString) : NULL;
-    if (versionCopy == NULL || (haveEncoding && encodingCopy == NULL)) {
-      free(versionCopy);
-      free(encodingCopy);
-      *allocationFailed = 1;
-      return 0;
-    }
-    {
-      int standaloneValue = standalone == 0xFF ? -1 : (standalone == 1 ? 1 : 0);
-      beginCallback(parser);
-      parser->xmlDeclHandler(parser->userData, versionCopy, encodingCopy,
-                             standaloneValue);
-      endCallback(parser);
-    }
-    free(versionCopy);
-    free(encodingCopy);
-    return 1;
-  }
-  case 1: { /* start element */
-    WireString name;
-    if (!readString(&reader, &name))
-      return 0;
-    return dispatchStart(parser, name, &reader, attributePairs, allocationFailed);
-  }
-  case 2: { /* end element */
-    WireString name;
-    if (!readString(&reader, &name) || reader.pos != reader.size)
-      return 0;
-    if (parser->endHandler == NULL)
-      return 1;
-    char *copy = copyString(name);
-    if (copy == NULL) {
-      *allocationFailed = 1;
-      return 0;
-    }
-    beginCallback(parser);
-    parser->endHandler(parser->userData, copy);
-    endCallback(parser);
-    free(copy);
-    return 1;
-  }
-  case 3: { /* character data */
-    WireString data;
-    if (!readString(&reader, &data) || reader.pos != reader.size)
-      return 0;
-    if (data.length > (uint32_t)INT_MAX)
-      return 0;
-    if (parser->characterHandler != NULL) {
-      beginCallback(parser);
-      parser->characterHandler(parser->userData, (const XML_Char *)data.bytes,
-                               (int)data.length);
-      endCallback(parser);
-    }
-    return 1;
-  }
-  case 4: /* CDATA start */
-    if (reader.pos != reader.size)
-      return 0;
-    if (parser->startCdataHandler != NULL) {
-      beginCallback(parser);
-      parser->startCdataHandler(parser->userData);
-      endCallback(parser);
-    }
-    return 1;
-  case 5: /* CDATA end */
-    if (reader.pos != reader.size)
-      return 0;
-    if (parser->endCdataHandler != NULL) {
-      beginCallback(parser);
-      parser->endCdataHandler(parser->userData);
-      endCallback(parser);
-    }
-    return 1;
-  case 6: { /* comment */
-    WireString data;
-    if (!readString(&reader, &data) || reader.pos != reader.size)
-      return 0;
-    if (parser->commentHandler == NULL)
-      return 1;
-    char *copy = copyString(data);
-    if (copy == NULL) {
-      *allocationFailed = 1;
-      return 0;
-    }
-    beginCallback(parser);
-    parser->commentHandler(parser->userData, copy);
-    endCallback(parser);
-    free(copy);
-    return 1;
-  }
-  case 7: { /* processing instruction */
-    WireString target;
-    WireString data;
-    if (!readString(&reader, &target) || !readString(&reader, &data) ||
-        reader.pos != reader.size)
-      return 0;
-    if (parser->piHandler == NULL)
-      return 1;
-    char *targetCopy = copyString(target);
-    char *dataCopy = copyString(data);
-    if (targetCopy == NULL || dataCopy == NULL) {
-      free(targetCopy);
-      free(dataCopy);
-      *allocationFailed = 1;
-      return 0;
-    }
-    beginCallback(parser);
-    parser->piHandler(parser->userData, targetCopy, dataCopy);
-    endCallback(parser);
-    free(targetCopy);
-    free(dataCopy);
-    return 1;
-  }
-  default:
-    return 0;
-  }
+  return 1;
 }
 
-uint64_t lexpat_cabi_emit_frame(lean_object *frame) {
-  XML_Parser parser = g_currentParser;
-  if (parser == NULL) {
-    lean_dec_ref(frame);
-    return 1;
-  }
-  size_t size = lean_sarray_size(frame);
-  const unsigned char *bytes = lean_sarray_cptr(frame);
-  int allocationFailed = 0;
-  int ok = dispatchWire(parser, bytes, size, &allocationFailed);
-  lean_dec_ref(frame);
-  if (!ok) {
-    /* A callback payload the shim could not allocate is an exhausted
-     * allocation, not a malformed frame; both are terminal, and `poison`
-     * preserves an earlier error. */
-    if (parser->error == XML_ERROR_NONE)
-      poison(parser, allocationFailed ? XML_ERROR_NO_MEMORY : XML_ERROR_MALFORMED_WIRE);
-    return 1;
-  }
+/* Refuse a payload the receiver cannot accept. */
+static uint64_t refuse(XML_Parser parser, enum XML_Error error) {
+  if (parser != NULL && parser->error == XML_ERROR_NONE)
+    poison(parser, error);
+  return 1;
+}
+
+/* The receiver's answer after a callback: continue only while the parser still
+ * wants more input and was not freed from inside the callback. */
+static uint64_t aborted(XML_Parser parser) {
   if (parser->deferredFree || parser->error != XML_ERROR_NONE)
     return 1;
   return 0;
 }
 
-uint64_t lexpat_cabi_reject_frame(uint64_t size) {
-  (void)size;
-  XML_Parser parser = g_currentParser;
-  if (parser != NULL)
-    poison(parser, XML_ERROR_LIMIT_TOKEN);
+/* Validate one payload string and charge its bytes to the event's ceiling. */
+static int validatePayload(lean_object *value, size_t *bytes, size_t *total) {
+  size_t n = stringBytes(value);
+  *total += n;
+  if (*total > LEXPAT_MAX_PAYLOAD)
+    return 0;
+  if (!validUtf8((const unsigned char *)lean_string_cstr(value), n))
+    return 0;
+  if (bytes != NULL)
+    *bytes = n;
   return 1;
+}
+
+/* Copy a validated payload string into NUL-terminated storage. */
+static char *copyPayload(lean_object *value, size_t *length, int *failed) {
+  size_t len = stringBytes(value);
+  char *copy = (char *)malloc(len + 1);
+  if (copy == NULL) {
+    *failed = 1;
+    return NULL;
+  }
+  memcpy(copy, lean_string_cstr(value), len + 1);
+  if (length != NULL)
+    *length = len;
+  return copy;
+}
+
+/* Validate the ordered attribute table: every name and value is a legal
+ * payload and the whole event stays inside the ceiling. */
+static int validateAttributes(lean_object *attrs, size_t *out_pairs) {
+  size_t pairs = lean_array_size(attrs);
+  size_t total = 0;
+  for (size_t i = 0; i < pairs; i++) {
+    lean_object *pair = lean_array_get_core(attrs, i);
+    for (unsigned side = 0; side < 2; side++) {
+      if (!validatePayload(lean_ctor_get(pair, side), NULL, &total))
+        return 0;
+    }
+  }
+  *out_pairs = pairs;
+  return 1;
+}
+
+/* Copy a validated attribute table into a NUL-terminated vector. */
+static int copyAttributes(lean_object *attrs, char ***out_pairs, size_t *out_count,
+                          int *failed) {
+  size_t pairs = lean_array_size(attrs);
+  if (pairs > (SIZE_MAX - 1) / (2 * sizeof(char *))) {
+    *failed = 0;
+    return 0;
+  }
+  char **result = (char **)calloc(pairs * 2 + 1, sizeof(char *));
+  if (result == NULL) {
+    *failed = 1;
+    return 0;
+  }
+  for (size_t i = 0; i < pairs; i++) {
+    lean_object *pair = lean_array_get_core(attrs, i);
+    for (unsigned side = 0; side < 2; side++) {
+      result[i * 2 + side] = copyPayload(lean_ctor_get(pair, side), NULL, failed);
+      if (result[i * 2 + side] == NULL) {
+        for (size_t k = 0; k < i * 2 + side; k++)
+          free(result[k]);
+        free(result);
+        return 0;
+      }
+    }
+  }
+  *out_pairs = result;
+  *out_count = pairs;
+  return 1;
+}
+
+uint64_t lexpat_cabi_emit_xml_decl(lean_object *version, lean_object *encoding,
+                                   uint8_t has_encoding, int64_t standalone,
+                                   uint64_t offset, uint64_t line, uint64_t column) {
+  XML_Parser parser = g_currentParser;
+  if (parser == NULL) {
+    lean_dec_ref(version);
+    lean_dec_ref(encoding);
+    return 1;
+  }
+  int malformed = 0;
+  size_t total = 0;
+  if (!setPosition(parser, offset, line, column) ||
+      (standalone != -1 && standalone != 0 && standalone != 1) ||
+      !validatePayload(version, NULL, &total))
+    malformed = 1;
+  if (!malformed && has_encoding && !validatePayload(encoding, NULL, &total))
+    malformed = 1;
+  if (malformed) {
+    lean_dec_ref(version);
+    lean_dec_ref(encoding);
+    return refuse(parser, XML_ERROR_MALFORMED_WIRE);
+  }
+  if (parser->xmlDeclHandler == NULL) {
+    lean_dec_ref(version);
+    lean_dec_ref(encoding);
+    return 0;
+  }
+  int failed = 0;
+  char *version_copy = copyPayload(version, NULL, &failed);
+  char *encoding_copy = NULL;
+  if (!failed && has_encoding)
+    encoding_copy = copyPayload(encoding, NULL, &failed);
+  lean_dec_ref(version);
+  lean_dec_ref(encoding);
+  if (failed) {
+    free(version_copy);
+    free(encoding_copy);
+    return refuse(parser, XML_ERROR_NO_MEMORY);
+  }
+  beginCallback(parser);
+  parser->xmlDeclHandler(parser->userData, version_copy, encoding_copy,
+                         (int)standalone);
+  endCallback(parser);
+  free(version_copy);
+  free(encoding_copy);
+  return aborted(parser);
+}
+
+/* Validate one range of `owner` as a payload: inside the owner, inside the bytes
+ * fed so far, legal UTF-8, and charged to the event's logical ceiling. */
+static int slicePayload(lean_object *owner, size_t size, uint64_t base,
+                        uint64_t start, uint64_t stop, uint64_t fed,
+                        size_t *total, const char **out, size_t *out_len) {
+  if (start > stop || stop > (uint64_t)size)
+    return 0;
+  if (base > UINT64_MAX - stop || base + stop > fed)
+    return 0;
+  size_t n = (size_t)(stop - start);
+  if (*total > LEXPAT_MAX_PAYLOAD - n)
+    return 0;
+  const char *bytes = (const char *)(lean_sarray_cptr(owner) + (size_t)start);
+  if (!validUtf8((const unsigned char *)bytes, n))
+    return 0;
+  *total += n;
+  *out = bytes;
+  *out_len = n;
+  return 1;
+}
+
+/* A start tag whose element name and ordered attribute pairs are still spans of
+ * `owner`: `ranges` holds four numbers per pair (name start, name stop, value
+ * start, value stop), all relative to `owner`, and `base` is the absolute offset
+ * of `owner`'s first byte. Every range is validated before anything is
+ * allocated, and the whole event is copied into one NUL-terminated arena plus
+ * one pointer vector, so an attribute-heavy tag costs two allocations instead of
+ * one per string. */
+uint64_t lexpat_cabi_emit_start_slice(lean_object *owner, uint64_t name_start,
+                                      uint64_t name_stop, uint64_t base,
+                                      lean_object *ranges, uint64_t offset,
+                                      uint64_t line, uint64_t column) {
+  XML_Parser parser = g_currentParser;
+  if (parser == NULL) {
+    lean_dec_ref(owner);
+    lean_dec_ref(ranges);
+    return 1;
+  }
+  size_t size = lean_sarray_size(owner);
+  size_t count = lean_array_size(ranges);
+  uint64_t fed = (uint64_t)parser->fedEnd;
+  int malformed = 0;
+  size_t pairs = 0;
+  size_t total = 0;
+  const char *element = NULL;
+  size_t element_len = 0;
+  if (!setPosition(parser, offset, line, column))
+    malformed = 1;
+  if (!malformed && count % 4 != 0)
+    malformed = 1;
+  if (!malformed && !slicePayload(owner, size, base, name_start, name_stop, fed,
+                                  &total, &element, &element_len))
+    malformed = 1;
+  if (!malformed) {
+    pairs = count / 4;
+    for (size_t i = 0; !malformed && i < pairs; i++) {
+      const char *ignored = NULL;
+      size_t ignored_len = 0;
+      for (unsigned side = 0; side < 2; side++) {
+        uint64_t start = lean_unbox_uint64(lean_array_get_core(ranges, 4 * i + 2 * side));
+        uint64_t stop = lean_unbox_uint64(lean_array_get_core(ranges, 4 * i + 2 * side + 1));
+        if (!slicePayload(owner, size, base, start, stop, fed, &total, &ignored,
+                          &ignored_len)) {
+          malformed = 1;
+          break;
+        }
+      }
+    }
+  }
+  if (malformed) {
+    lean_dec_ref(owner);
+    lean_dec_ref(ranges);
+    return refuse(parser, XML_ERROR_MALFORMED_WIRE);
+  }
+  if (parser->startHandler == NULL) {
+    lean_dec_ref(owner);
+    lean_dec_ref(ranges);
+    return 0;
+  }
+  size_t strings = pairs * 2 + 1;
+  if (total > SIZE_MAX - strings ||
+      pairs > (SIZE_MAX - 1) / (2 * sizeof(char *))) {
+    lean_dec_ref(owner);
+    lean_dec_ref(ranges);
+    return refuse(parser, XML_ERROR_NO_MEMORY);
+  }
+  char *arena = (char *)malloc(total + strings);
+  char **atts = (char **)calloc(pairs * 2 + 1, sizeof(char *));
+  if (arena == NULL || atts == NULL) {
+    free(arena);
+    free(atts);
+    lean_dec_ref(owner);
+    lean_dec_ref(ranges);
+    return refuse(parser, XML_ERROR_NO_MEMORY);
+  }
+  size_t used = 0;
+  memcpy(arena + used, element, element_len);
+  arena[used + element_len] = '\0';
+  char *element_copy = arena + used;
+  used += element_len + 1;
+  for (size_t i = 0; i < pairs * 2; i++) {
+    uint64_t start = lean_unbox_uint64(lean_array_get_core(ranges, 2 * i));
+    uint64_t stop = lean_unbox_uint64(lean_array_get_core(ranges, 2 * i + 1));
+    size_t n = (size_t)(stop - start);
+    memcpy(arena + used, (const char *)(lean_sarray_cptr(owner) + (size_t)start), n);
+    arena[used + n] = '\0';
+    atts[i] = arena + used;
+    used += n + 1;
+  }
+  lean_dec_ref(owner);
+  lean_dec_ref(ranges);
+  parser->specifiedAttrs = (int)(pairs * 2);
+  beginCallback(parser);
+  parser->startHandler(parser->userData, element_copy, (const XML_Char **)atts);
+  endCallback(parser);
+  parser->specifiedAttrs = 0;
+  free(atts);
+  free(arena);
+  return aborted(parser);
+}
+
+uint64_t lexpat_cabi_emit_start(lean_object *name, lean_object *attrs,
+                                uint64_t offset, uint64_t line, uint64_t column) {
+  XML_Parser parser = g_currentParser;
+  if (parser == NULL) {
+    lean_dec_ref(name);
+    lean_dec_ref(attrs);
+    return 1;
+  }
+  int malformed = 0;
+  size_t total = 0;
+  size_t pairs = 0;
+  if (!setPosition(parser, offset, line, column) ||
+      !validatePayload(name, NULL, &total) || !validateAttributes(attrs, &pairs))
+    malformed = 1;
+  if (malformed) {
+    lean_dec_ref(name);
+    lean_dec_ref(attrs);
+    return refuse(parser, XML_ERROR_MALFORMED_WIRE);
+  }
+  if (parser->startHandler == NULL) {
+    lean_dec_ref(name);
+    lean_dec_ref(attrs);
+    return 0;
+  }
+  int failed = 0;
+  char *element = copyPayload(name, NULL, &failed);
+  char **atts = NULL;
+  size_t copied = 0;
+  if (!failed && !copyAttributes(attrs, &atts, &copied, &failed))
+    failed = failed || 1;
+  lean_dec_ref(name);
+  lean_dec_ref(attrs);
+  if (failed) {
+    free(element);
+    return refuse(parser, XML_ERROR_NO_MEMORY);
+  }
+  parser->specifiedAttrs = (int)(copied * 2);
+  beginCallback(parser);
+  parser->startHandler(parser->userData, element, (const XML_Char **)atts);
+  endCallback(parser);
+  parser->specifiedAttrs = 0;
+  for (size_t i = 0; i < copied * 2; i++)
+    free(atts[i]);
+  free(atts);
+  free(element);
+  return aborted(parser);
+}
+
+uint64_t lexpat_cabi_emit_end(lean_object *name, uint64_t offset, uint64_t line,
+                              uint64_t column) {
+  XML_Parser parser = g_currentParser;
+  if (parser == NULL) {
+    lean_dec_ref(name);
+    return 1;
+  }
+  int malformed = 0;
+  size_t total = 0;
+  if (!setPosition(parser, offset, line, column) ||
+      !validatePayload(name, NULL, &total))
+    malformed = 1;
+  if (malformed) {
+    lean_dec_ref(name);
+    return refuse(parser, XML_ERROR_MALFORMED_WIRE);
+  }
+  if (parser->endHandler == NULL) {
+    lean_dec_ref(name);
+    return 0;
+  }
+  int failed = 0;
+  char *element = copyPayload(name, NULL, &failed);
+  lean_dec_ref(name);
+  if (failed) {
+    free(element);
+    return refuse(parser, XML_ERROR_NO_MEMORY);
+  }
+  beginCallback(parser);
+  parser->endHandler(parser->userData, element);
+  endCallback(parser);
+  free(element);
+  return aborted(parser);
+}
+
+/* An end tag whose name is still a span of `owner`. */
+uint64_t lexpat_cabi_emit_end_slice(lean_object *owner, uint64_t name_start,
+                                    uint64_t name_stop, uint64_t base,
+                                    uint64_t offset, uint64_t line, uint64_t column) {
+  XML_Parser parser = g_currentParser;
+  if (parser == NULL) {
+    lean_dec_ref(owner);
+    return 1;
+  }
+  size_t size = lean_sarray_size(owner);
+  size_t total = 0;
+  const char *name = NULL;
+  size_t name_len = 0;
+  int malformed =
+      !setPosition(parser, offset, line, column) ||
+      !slicePayload(owner, size, base, name_start, name_stop,
+                    (uint64_t)parser->fedEnd, &total, &name, &name_len);
+  if (malformed) {
+    lean_dec_ref(owner);
+    return refuse(parser, XML_ERROR_MALFORMED_WIRE);
+  }
+  if (parser->endHandler == NULL) {
+    lean_dec_ref(owner);
+    return 0;
+  }
+  char *copy = (char *)malloc(name_len + 1);
+  if (copy == NULL) {
+    lean_dec_ref(owner);
+    return refuse(parser, XML_ERROR_NO_MEMORY);
+  }
+  memcpy(copy, name, name_len);
+  copy[name_len] = '\0';
+  lean_dec_ref(owner);
+  beginCallback(parser);
+  parser->endHandler(parser->userData, copy);
+  endCallback(parser);
+  free(copy);
+  return aborted(parser);
+}
+
+/* Literal character data. The payload is borrowed from the Lean array that
+ * owns the fed chunk and passed with an explicit length; nothing is copied. */
+uint64_t lexpat_cabi_emit_text(lean_object *owner, uint64_t start, uint64_t stop,
+                               uint64_t base, uint64_t offset, uint64_t line,
+                               uint64_t column) {
+  XML_Parser parser = g_currentParser;
+  if (parser == NULL) {
+    lean_dec_ref(owner);
+    return 1;
+  }
+  int malformed = 0;
+  size_t size = lean_sarray_size(owner);
+  uint64_t length = 0;
+  if (!setPosition(parser, offset, line, column))
+    malformed = 1;
+  if (!malformed && (start > stop || stop > (uint64_t)size))
+    malformed = 1;
+  if (!malformed && start > UINT64_MAX - base)
+    malformed = 1;
+  if (!malformed) {
+    length = stop - start;
+    uint64_t absolute_start = base + start;
+    uint64_t absolute_stop = base + stop;
+    if (absolute_start < offset || absolute_stop > (uint64_t)parser->fedEnd)
+      malformed = 1;
+    else if (length > (uint64_t)LEXPAT_MAX_PAYLOAD || length > (uint64_t)INT_MAX)
+      malformed = 1;
+    else if (!validUtf8(lean_sarray_cptr(owner) + start, (size_t)length))
+      malformed = 1;
+  }
+  if (malformed) {
+    lean_dec_ref(owner);
+    return refuse(parser, XML_ERROR_MALFORMED_WIRE);
+  }
+  if (parser->characterHandler != NULL) {
+    beginCallback(parser);
+    parser->characterHandler(parser->userData,
+                             (const XML_Char *)(lean_sarray_cptr(owner) + start),
+                             (int)length);
+    endCallback(parser);
+  }
+  lean_dec_ref(owner);
+  return aborted(parser);
+}
+
+/* Character data that had to be materialized: a reference expansion, a
+ * normalized line ending or a token that crossed a feed boundary.
+ *
+ * The payload is a Lean string, which owns its UTF-8 bytes and stays referenced
+ * for this call, so the length-delimited handler reads it in place: character
+ * data has no NUL-termination requirement and no copy is needed. */
+uint64_t lexpat_cabi_emit_text_string(lean_object *data, uint64_t offset,
+                                      uint64_t line, uint64_t column) {
+  XML_Parser parser = g_currentParser;
+  if (parser == NULL) {
+    lean_dec_ref(data);
+    return 1;
+  }
+  size_t length = stringBytes(data);
+  int malformed =
+      !setPosition(parser, offset, line, column) ||
+      length > (size_t)LEXPAT_MAX_PAYLOAD || length > (size_t)INT_MAX ||
+      !validUtf8((const unsigned char *)lean_string_cstr(data), length);
+  if (malformed) {
+    lean_dec_ref(data);
+    return refuse(parser, XML_ERROR_MALFORMED_WIRE);
+  }
+  if (parser->characterHandler != NULL) {
+    beginCallback(parser);
+    parser->characterHandler(parser->userData,
+                             (const XML_Char *)lean_string_cstr(data), (int)length);
+    endCallback(parser);
+  }
+  lean_dec_ref(data);
+  return aborted(parser);
+}
+
+/* Materialized character data held by the stream as its own byte array: a
+ * reference expansion, a normalized line ending or a token that crossed a feed
+ * boundary. The array owns its bytes and stays referenced for this call, so the
+ * length-delimited handler reads them in place: character data has no
+ * NUL-termination requirement and no copy is needed. */
+uint64_t lexpat_cabi_emit_text_bytes(lean_object *data, uint64_t offset,
+                                     uint64_t line, uint64_t column) {
+  XML_Parser parser = g_currentParser;
+  if (parser == NULL) {
+    lean_dec_ref(data);
+    return 1;
+  }
+  size_t length = lean_sarray_size(data);
+  const unsigned char *bytes = lean_sarray_cptr(data);
+  int malformed =
+      !setPosition(parser, offset, line, column) ||
+      length > (size_t)LEXPAT_MAX_PAYLOAD || length > (size_t)INT_MAX ||
+      !validUtf8(bytes, length);
+  if (malformed) {
+    lean_dec_ref(data);
+    return refuse(parser, XML_ERROR_MALFORMED_WIRE);
+  }
+  if (parser->characterHandler != NULL) {
+    beginCallback(parser);
+    parser->characterHandler(parser->userData, (const XML_Char *)bytes,
+                             (int)length);
+    endCallback(parser);
+  }
+  lean_dec_ref(data);
+  return aborted(parser);
+}
+
+uint64_t lexpat_cabi_emit_cdata_start(uint64_t offset, uint64_t line,
+                                      uint64_t column) {
+  XML_Parser parser = g_currentParser;
+  if (parser == NULL)
+    return 1;
+  if (!setPosition(parser, offset, line, column))
+    return refuse(parser, XML_ERROR_MALFORMED_WIRE);
+  if (parser->startCdataHandler != NULL) {
+    beginCallback(parser);
+    parser->startCdataHandler(parser->userData);
+    endCallback(parser);
+  }
+  return aborted(parser);
+}
+
+uint64_t lexpat_cabi_emit_cdata_end(uint64_t offset, uint64_t line, uint64_t column) {
+  XML_Parser parser = g_currentParser;
+  if (parser == NULL)
+    return 1;
+  if (!setPosition(parser, offset, line, column))
+    return refuse(parser, XML_ERROR_MALFORMED_WIRE);
+  if (parser->endCdataHandler != NULL) {
+    beginCallback(parser);
+    parser->endCdataHandler(parser->userData);
+    endCallback(parser);
+  }
+  return aborted(parser);
+}
+
+uint64_t lexpat_cabi_emit_comment(lean_object *data, uint64_t offset, uint64_t line,
+                                  uint64_t column) {
+  XML_Parser parser = g_currentParser;
+  if (parser == NULL) {
+    lean_dec_ref(data);
+    return 1;
+  }
+  int malformed = 0;
+  size_t total = 0;
+  if (!setPosition(parser, offset, line, column) ||
+      !validatePayload(data, NULL, &total))
+    malformed = 1;
+  if (malformed) {
+    lean_dec_ref(data);
+    return refuse(parser, XML_ERROR_MALFORMED_WIRE);
+  }
+  if (parser->commentHandler == NULL) {
+    lean_dec_ref(data);
+    return 0;
+  }
+  int failed = 0;
+  char *copy = copyPayload(data, NULL, &failed);
+  lean_dec_ref(data);
+  if (failed) {
+    free(copy);
+    return refuse(parser, XML_ERROR_NO_MEMORY);
+  }
+  beginCallback(parser);
+  parser->commentHandler(parser->userData, copy);
+  endCallback(parser);
+  free(copy);
+  return aborted(parser);
+}
+
+uint64_t lexpat_cabi_emit_pi(lean_object *target, lean_object *data, uint64_t offset,
+                             uint64_t line, uint64_t column) {
+  XML_Parser parser = g_currentParser;
+  if (parser == NULL) {
+    lean_dec_ref(target);
+    lean_dec_ref(data);
+    return 1;
+  }
+  int malformed = 0;
+  size_t total = 0;
+  if (!setPosition(parser, offset, line, column) ||
+      !validatePayload(target, NULL, &total) ||
+      !validatePayload(data, NULL, &total))
+    malformed = 1;
+  if (malformed) {
+    lean_dec_ref(target);
+    lean_dec_ref(data);
+    return refuse(parser, XML_ERROR_MALFORMED_WIRE);
+  }
+  if (parser->piHandler == NULL) {
+    lean_dec_ref(target);
+    lean_dec_ref(data);
+    return 0;
+  }
+  int failed = 0;
+  char *target_copy = copyPayload(target, NULL, &failed);
+  char *data_copy = NULL;
+  if (!failed)
+    data_copy = copyPayload(data, NULL, &failed);
+  lean_dec_ref(target);
+  lean_dec_ref(data);
+  if (failed) {
+    free(target_copy);
+    free(data_copy);
+    return refuse(parser, XML_ERROR_NO_MEMORY);
+  }
+  beginCallback(parser);
+  parser->piHandler(parser->userData, target_copy, data_copy);
+  endCallback(parser);
+  free(target_copy);
+  free(data_copy);
+  return aborted(parser);
 }
 
 uint64_t lexpat_cabi_report_status(uint64_t status, uint64_t code, uint64_t offset,
@@ -770,7 +1049,11 @@ static enum XML_Status doParse(XML_Parser parser, const char *data, size_t lengt
    * before the feed: final callbacks see XML_TRUE and non-final ones see
    * XML_FALSE. */
   parser->finalBuffer = isFinal ? XML_TRUE : XML_FALSE;
-  parser->fedEnd = parser->rawConsumed + length;
+  /* The upper bound for any source position a callback may name: the bytes
+   * handed to this parser through the end of this call. The stream's own
+   * `rawConsumed` can lag behind while it holds an unfinished start tag, so it
+   * cannot be used as that bound. */
+  parser->fedEnd = parser->fedEnd + length;
   runFeed(parser, data, length);
   if (parser->deferredFree) {
     releaseParser(parser);
@@ -932,7 +1215,11 @@ void *XML_GetBuffer(XML_Parser parser, int len) {
     poison(parser, XML_ERROR_REENTRANT_CALL);
     return NULL;
   }
-  if (len < 0 || (size_t)len > LEXPAT_MAX_INPUT - parser->rawConsumed) {
+  /* The remaining raw-input budget is measured from the bytes handed to this
+   * parser, not from the bytes the stream has consumed: an unfinished start tag
+   * held over a feed boundary lags `rawConsumed`, and a reservation must not slip
+   * past the budget through that gap. */
+  if (len < 0 || (size_t)len > LEXPAT_MAX_INPUT - parser->fedEnd) {
     poison(parser, XML_ERROR_INVALID_ARGUMENT);
     return NULL;
   }

@@ -81,8 +81,17 @@ if [ -n "${NIX_LDFLAGS:-}" ]; then
   link_env=(env -u NIX_LDFLAGS)
 fi
 
+# The shared object is not unloadable. Initializing the Lean runtime starts
+# background threads whose entry points are inside `libleanshared.so`, and the
+# Lean runtime has no shutdown entry point that would stop and join them. A
+# `dlclose` of this object therefore releases the runtime under threads that are
+# still running in it: at best the unload races a thread that has not reached its
+# first instruction yet, at worst it unmaps code a parked thread will return
+# into. `-z nodelete` keeps this object and the runtime it depends on mapped for
+# the life of the process, which is the lifetime those threads assume.
 "${link_env[@]}" "$cc" -shared -o "$out" "$work/expat.o" "${objs[@]}" \
   -L"$lean_libdir" -lleanshared -pthread \
+  -Wl,-z,nodelete \
   -Wl,--no-undefined \
   -Wl,-soname,liblexpat.so.1 \
   -Wl,-rpath,"$lean_libdir" \

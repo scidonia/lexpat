@@ -82,10 +82,12 @@ if [ -z "$build_dir" ]; then
   build_dir="$out/build"
   bash "$repo/scripts/security-fuzz-build.sh" --out "$build_dir"
 fi
-if [ ! -x "$build_dir/$binary" ]; then
-  echo "campaign: missing $build_dir/$binary" >&2
+# Validate the prepared build before any target runs: a stale or mismatched
+# build is refused here, not after a campaign has burned its budget.
+python3 "$repo/scripts/security-fuzz-verify.py" --build-dir "$build_dir" || {
+  echo "campaign: prepared build refused" >&2
   exit 1
-fi
+}
 
 corpus="$out/corpus"
 artifacts="$out/artifacts"
@@ -119,10 +121,9 @@ if [ -z "$rss_kb" ]; then
 fi
 coverage="$(grep -o 'stat::number_of_executed_units: [0-9]*\|cov: [0-9]*\|ft: [0-9]*' "$out/stderr.log" | tail -n 3 | tr '\n' ' ')"
 artifact_count="$(find "$artifacts" -type f | wc -l)"
-build_manifest=""
-if [ -f "$build_dir/source-manifest.sha256" ]; then
-  build_manifest="$(sha256sum "$build_dir/source-manifest.sha256" | cut -d' ' -f1)"
-fi
+build_manifest="$(sha256sum "$build_dir/source-manifest.sha256" | cut -d' ' -f1)"
+build_json="$(sha256sum "$build_dir/build.json" | cut -d' ' -f1)"
+targets_manifest="$(sha256sum "$build_dir/targets.sha256" | cut -d' ' -f1)"
 
 python3 - "$out/run.json" "$target" "$binary" "$runs" "$completed" "$seed" \
   "$max_len" \
@@ -130,13 +131,14 @@ python3 - "$out/run.json" "$target" "$binary" "$runs" "$completed" "$seed" \
   "$elapsed_ms" "$rss_kb" "$status" "$artifact_count" "$coverage" \
   "$(git -C "$repo" rev-parse HEAD)" \
   "$(git -C "$repo" status --porcelain | sha256sum | cut -d' ' -f1)" \
-  "$build_manifest" "$corpus_digest" "$initial_files" <<'PY'
+  "$build_manifest" "$build_json" "$targets_manifest" "$corpus_digest" \
+  "$initial_files" <<'PY'
 import json
 import sys
 
 (out, target, binary, runs, completed, seed, max_len, command, elapsed, rss,
- status, artifacts, coverage, revision, dirty, build_manifest, corpus_digest,
- files) = sys.argv[1:]
+ status, artifacts, coverage, revision, dirty, build_manifest, build_json,
+ targets_manifest, corpus_digest, files) = sys.argv[1:]
 row = {
     "format": 1,
     "target": target,
@@ -154,6 +156,8 @@ row = {
     "revision": revision,
     "dirty_digest": dirty,
     "build_manifest_sha256": build_manifest,
+    "build_json_sha256": build_json,
+    "targets_manifest_sha256": targets_manifest,
     "initial_corpus_digest": corpus_digest,
     "initial_corpus_files": int(files),
 }

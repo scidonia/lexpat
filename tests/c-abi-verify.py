@@ -7,7 +7,12 @@ The checks are grouped so each acceptance criterion has its own command:
                  opaque `XML_Parser`, and the pinned `XML_GetUserData` macro
                  used with the candidate library
   --abi          exact dynamic `XML_*` export allowlist against the header,
-                 SONAME/NEEDED/RUNPATH, loader resolution and a real launch
+                 SONAME/NEEDED/RUNPATH, loader resolution, a real launch, the
+                 `FLAGS_1` `NODELETE` entry that keeps the initialized runtime
+                 mapped after `dlclose`, and 16 fresh-process load/parse/free/
+                 close clients under one 60-second aggregate deadline
+                 (`--base-lib <absolute .so>` applies the same detector to a
+                 base artifact and requires it to lack `NODELETE`)
   --layout       public enumerator values and defined struct sizes, alignment
                  and offsets equal the pinned system Expat header
   --identity     truthful version, version info, compile-time macros and feature
@@ -21,12 +26,12 @@ The checks are grouped so each acceptance criterion has its own command:
                  BOM, CRLF, reference, CDATA, empty-tag and chunked cases
   --unsupported  every declared unsupported family fails closed without a
                  resolver, including the parameter-entity timing rule
-  --wire         malformed version-1 event frames and impossible source
-                 metadata terminate only their parser without delivering a
-                 callback; an impossible attribute-pair count is rejected
-                 before any vector allocation, a shim allocation failure is
-                 reported as `XML_ERROR_NO_MEMORY`, and an unhandled event
-                 allocates no payload copy
+  --bridge       the callback-specific direct receivers refuse inverted, oversized
+                 or out-of-bounds text spans, impossible positions, invalid UTF-8
+                 and impossible declaration metadata before any callback, report
+                 a shim allocation failure as `XML_ERROR_NO_MEMORY`, deliver every
+                 handler family affirmatively, and allocate no payload copy for an
+                 event with no handler
   --adversarial  NULL handles, invalid lengths, capacity arithmetic, re-entrant
                  parses, callback-time parser creation and free-in-callback
                  behavior
@@ -45,6 +50,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -54,7 +60,7 @@ LIB = LIB_DIR / "liblexpat.so.1"
 CLIENT_SRC = ROOT / "tests" / "c-abi-client.c"
 
 GROUPS = ["header", "abi", "layout", "identity", "lifecycle", "buffers",
-          "errors", "locations", "unsupported", "wire", "adversarial", "docs"]
+          "errors", "locations", "unsupported", "bridge", "adversarial", "docs"]
 
 
 class VerifyError(Exception):
@@ -1652,438 +1658,112 @@ int main(int argc, char **argv) {
 }
 """
 
-WIRE_SOURCE = r"""
-/*
- * Malformed event-frame checks. This program links the C shim and the Lean
- * module objects directly into a test executable; it is a test target, not a
- * shared object and not an exported bypass. A callback injects a fabricated
- * version-1 frame through the same receiver the Lean producer calls, and the
- * parser's own error state and callback records are asserted.
+BRIDGE_SOURCE = r"""/*
+ * Direct-bridge checks. This program links the C shim and the Lean module
+ * objects directly into a test executable; it is a test target, not a shared
+ * object and not an exported bypass. From inside a registered callback it
+ * calls the same callback-specific receivers the Lean producer calls, with
+ * fabricated Lean objects, and asserts the parser's error state and handler
+ * calls.
+ *
+ * The control set covers: a well-formed text span, start, end, comment,
+ * processing instruction, CDATA and declaration delivered to real handlers; a
+ * span whose bounds are inverted, past the owner, past the bytes already fed,
+ * or whose position is impossible; payloads that are not legal UTF-8; a NUL in
+ * a text payload; an impossible standalone value; an allocation failure; and
+ * the absence of any payload allocation when no handler is installed.
  */
 
 #include "expat.h"
 #include <lean/lean.h>
 
+#include <inttypes.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-extern uint64_t lexpat_cabi_emit_frame(lean_object *frame);
-extern uint64_t lexpat_cabi_reject_frame(uint64_t size);
+extern uint64_t lexpat_cabi_emit_xml_decl(lean_object *version, lean_object *encoding,
+                                          uint8_t has_encoding, int64_t standalone,
+                                          uint64_t offset, uint64_t line,
+                                          uint64_t column);
+extern uint64_t lexpat_cabi_emit_start(lean_object *name, lean_object *attrs,
+                                       uint64_t offset, uint64_t line,
+                                       uint64_t column);
+extern uint64_t lexpat_cabi_emit_end(lean_object *name, uint64_t offset, uint64_t line,
+                                     uint64_t column);
+extern uint64_t lexpat_cabi_emit_text(lean_object *owner, uint64_t start, uint64_t stop,
+                                      uint64_t base, uint64_t offset, uint64_t line,
+                                      uint64_t column);
+extern uint64_t lexpat_cabi_emit_text_string(lean_object *data, uint64_t offset,
+                                             uint64_t line, uint64_t column);
+extern uint64_t lexpat_cabi_emit_text_bytes(lean_object *data, uint64_t offset,
+                                            uint64_t line, uint64_t column);
+extern uint64_t lexpat_cabi_emit_cdata_start(uint64_t offset, uint64_t line,
+                                             uint64_t column);
+extern uint64_t lexpat_cabi_emit_cdata_end(uint64_t offset, uint64_t line,
+                                           uint64_t column);
+extern uint64_t lexpat_cabi_emit_comment(lean_object *data, uint64_t offset,
+                                         uint64_t line, uint64_t column);
+extern uint64_t lexpat_cabi_emit_pi(lean_object *target, lean_object *data,
+                                    uint64_t offset, uint64_t line, uint64_t column);
 
 /* The shim copies callback payloads with malloc/calloc. Wrapping those two
- * symbols counts the linked shim's allocations only; the Lean runtime's own
- * allocator lives in its shared library and is unaffected. */
-/* The calloc wrapper refuses a request above this fixed cap instead of
- * delegating it. A 16 MiB event frame can describe at most 2,097,148
- * attribute pairs, whose vector is about 32 MiB, so the cap cannot interfere
- * with a frame the format itself permits; an unbounded pair count would ask
- * for tens of gigabytes. */
-#define CALLOC_CAP ((size_t)64 * 1024 * 1024)
-
+ * symbols counts the linked shim's allocations only. A countdown armed before
+ * an injection makes that one allocation fail. */
 static int counting;
 static long allocations;
-static int calloc_calls;
-static size_t last_calloc;
-static unsigned long long oversized_request;
-static int oversized_calloc;
-/* -1 disarms; otherwise the named index of the next counting allocation fails
- * once and the countdown clears. Only the directly linked shim is affected. */
 static int fail_malloc_countdown = -1;
-static int fail_calloc_countdown = -1;
-static int injected_failures;
 
 void *__real_malloc(size_t size);
 void *__real_calloc(size_t count, size_t size);
 
 void *__wrap_malloc(size_t size) {
-  if (counting) {
+  if (counting)
     allocations++;
-    if (fail_malloc_countdown >= 0) {
-      if (fail_malloc_countdown == 0) {
-        fail_malloc_countdown = -1;
-        injected_failures++;
-        return NULL;
-      }
-      fail_malloc_countdown--;
-    }
+  if (fail_malloc_countdown == 0) {
+    fail_malloc_countdown = -1;
+    return NULL;
   }
+  if (fail_malloc_countdown > 0)
+    fail_malloc_countdown--;
   return __real_malloc(size);
 }
 
 void *__wrap_calloc(size_t count, size_t size) {
-  if (counting) {
+  if (counting)
     allocations++;
-    calloc_calls++;
-    if (fail_calloc_countdown >= 0) {
-      if (fail_calloc_countdown == 0) {
-        fail_calloc_countdown = -1;
-        injected_failures++;
-        return NULL;
-      }
-      fail_calloc_countdown--;
-    }
-    if (count != 0 && size > SIZE_MAX / count) {
-      oversized_calloc++;
-      return NULL;
-    }
-    size_t total = count * size;
-    last_calloc = total;
-    if (total > CALLOC_CAP) {
-      oversized_calloc++;
-      oversized_request = (unsigned long long)total;
-      return NULL;
-    }
+  if (fail_malloc_countdown == 0) {
+    fail_malloc_countdown = -1;
+    return NULL;
   }
+  if (fail_malloc_countdown > 0)
+    fail_malloc_countdown--;
   return __real_calloc(count, size);
 }
 
 static XML_Parser P;
-static int calls;
-static int ends;
-static int decls;
-static int comments;
-static int pis;
-static int injects;
-static int which;
-static int last_emit;
+static int injecting;
+static int triggered;
+static long calls;
+static long pairs;
+static long chars;
+static uint64_t last_emit;
 static int last_code;
-static int record_pairs;
-static int last_pairs;
+static int pending_case;
 
-static lean_object *make_frame_full(uint8_t tag, uint64_t line, uint64_t offset,
-                                    uint64_t column, uint32_t token,
-                                    uint32_t pairs_header, int bad_magic,
-                                    int bad_version, int reserved,
-                                    uint32_t length_delta,
-                                    const unsigned char *payload, uint32_t length) {
-  uint32_t total = 44 + length + length_delta;
-  lean_object *frame = lean_alloc_sarray(1, total, total);
-  unsigned char *bytes = lean_sarray_cptr(frame);
-  size_t at = 0;
-  bytes[at++] = bad_magic ? 'X' : 'L';
-  bytes[at++] = 'X';
-  bytes[at++] = 'E';
-  bytes[at++] = 'V';
-  bytes[at++] = bad_version ? 2 : 1;
-  bytes[at++] = tag;
-  bytes[at++] = reserved ? 1 : 0;
-  bytes[at++] = 0;
-  bytes[at++] = (unsigned char)(total & 0xff);
-  bytes[at++] = (unsigned char)((total >> 8) & 0xff);
-  bytes[at++] = (unsigned char)((total >> 16) & 0xff);
-  bytes[at++] = (unsigned char)((total >> 24) & 0xff);
-  {
-    int i;
-    for (i = 0; i < 8; i++)
-      bytes[at++] = (unsigned char)((offset >> (8 * i)) & 0xff);
-    for (i = 0; i < 8; i++)
-      bytes[at++] = (unsigned char)((line >> (8 * i)) & 0xff);
-    for (i = 0; i < 8; i++)
-      bytes[at++] = (unsigned char)((column >> (8 * i)) & 0xff);
-    bytes[at++] = (unsigned char)(token & 0xff);
-    bytes[at++] = (unsigned char)((token >> 8) & 0xff);
-    bytes[at++] = (unsigned char)((token >> 16) & 0xff);
-    bytes[at++] = (unsigned char)((token >> 24) & 0xff);
-    bytes[at++] = (unsigned char)(pairs_header & 0xff);
-    bytes[at++] = (unsigned char)((pairs_header >> 8) & 0xff);
-    bytes[at++] = (unsigned char)((pairs_header >> 16) & 0xff);
-    bytes[at++] = (unsigned char)((pairs_header >> 24) & 0xff);
-  }
-  if (length > 0)
-    memcpy(bytes + at, payload, length);
-  return frame;
-}
+static void XMLCALL on_start(void *userData, const XML_Char *name,
+                             const XML_Char **atts);
+static uint64_t inject_case(int which);
 
-static lean_object *make_frame(uint8_t tag, uint64_t line, uint64_t offset,
-                               uint32_t token, uint32_t pairs_header,
-                               int bad_magic, int bad_version, int reserved,
-                               uint32_t length_delta, const unsigned char *payload,
-                               uint32_t length) {
-  return make_frame_full(tag, line, offset, 0, token, pairs_header, bad_magic,
-                         bad_version, reserved, length_delta, payload, length);
-}
-
-static uint32_t put_string(unsigned char *out, const char *text) {
-  uint32_t length = (uint32_t)strlen(text);
-  out[0] = (unsigned char)(length & 0xff);
-  out[1] = (unsigned char)((length >> 8) & 0xff);
-  out[2] = (unsigned char)((length >> 16) & 0xff);
-  out[3] = (unsigned char)((length >> 24) & 0xff);
-  memcpy(out + 4, text, length);
-  return 4 + length;
-}
-
-static uint32_t put_u32(unsigned char *out, uint32_t value) {
-  out[0] = (unsigned char)(value & 0xff);
-  out[1] = (unsigned char)((value >> 8) & 0xff);
-  out[2] = (unsigned char)((value >> 16) & 0xff);
-  out[3] = (unsigned char)((value >> 24) & 0xff);
-  return 4;
-}
-
-static lean_object *start_frame(const char *name, uint32_t pairs_header) {
-  unsigned char payload[512];
-  uint32_t at = put_string(payload, name);
-  at += put_u32(payload + at, 0);
-  return make_frame(1, 1, 0, 4u, pairs_header, 0, 0, 0, 0, payload, at);
-}
-
-/* A start frame whose payload declares `pairs` pairs and then carries none:
- * a valid frame only when `pairs` is zero. */
-static lean_object *start_frame_count(const char *name, uint32_t pairs) {
-  unsigned char payload[512];
-  uint32_t at = put_string(payload, name);
-  at += put_u32(payload + at, pairs);
-  return make_frame(1, 1, 0, 4u, pairs, 0, 0, 0, 0, payload, at);
-}
-
-/* One start element with exactly one ordered attribute pair. */
-static lean_object *start_frame_pairs(void) {
-  unsigned char payload[128];
-  uint32_t at = put_string(payload, "x");
-  at += put_u32(payload + at, 1);
-  at += put_string(payload + at, "a");
-  at += put_string(payload + at, "1");
-  return make_frame(1, 1, 0, 4u, 1, 0, 0, 0, 0, payload, at);
-}
-
-static lean_object *decl_frame(int with_encoding) {
-  unsigned char payload[64];
-  uint32_t at = put_string(payload, "1.0");
-  payload[at++] = with_encoding ? 1 : 0;
-  if (with_encoding)
-    at += put_string(payload + at, "UTF-8");
-  payload[at++] = 0xFF;
-  return make_frame(0, 1, 0, 4u, 0, 0, 0, 0, 0, payload, at);
-}
-
-static lean_object *named_frame(uint8_t tag, const char *name) {
-  unsigned char payload[64];
-  uint32_t at = put_string(payload, name);
-  return make_frame(tag, 1, 0, 4u, 0, 0, 0, 0, 0, payload, at);
-}
-
-static lean_object *pi_frame(void) {
-  unsigned char payload[64];
-  uint32_t at = put_string(payload, "p");
-  at += put_string(payload + at, "d");
-  return make_frame(7, 1, 0, 4u, 0, 0, 0, 0, 0, payload, at);
-}
-
-/* Count one injected dispatch and let it be inspected afterwards. */
-static void arm(int fail_malloc, int fail_calloc) {
-  counting = 1;
-  allocations = 0;
-  calloc_calls = 0;
-  last_calloc = 0;
-  oversized_calloc = 0;
-  oversized_request = 0;
-  fail_malloc_countdown = fail_malloc;
-  fail_calloc_countdown = fail_calloc;
-}
-
-static void disarm(void) {
-  counting = 0;
-  fail_malloc_countdown = -1;
-  fail_calloc_countdown = -1;
-}
-
-static void inject(void) {
-  unsigned char payload[256];
-  uint32_t at = 0;
-  lean_object *frame = NULL;
-  switch (which) {
-  case 0: /* affirmative control: a well-formed start frame is delivered */
-    frame = start_frame("x", 0);
-    break;
-  case 1: /* shorter than the 44-byte header */
-    frame = lean_alloc_sarray(1, 43, 43);
-    memset(lean_sarray_cptr(frame), 0, 43);
-    break;
-  case 2: /* wrong magic */
-    at = put_string(payload, "x");
-    payload[at++] = 0; payload[at++] = 0; payload[at++] = 0; payload[at++] = 0;
-    frame = make_frame(1, 1, 0, 0xFFFFFFFFu, 0, 1, 0, 0, 0, payload, at);
-    break;
-  case 3: /* unknown version */
-    at = put_string(payload, "x");
-    payload[at++] = 0; payload[at++] = 0; payload[at++] = 0; payload[at++] = 0;
-    frame = make_frame(1, 1, 0, 0xFFFFFFFFu, 0, 0, 1, 0, 0, payload, at);
-    break;
-  case 4: /* reserved bytes must be zero */
-    at = put_string(payload, "x");
-    payload[at++] = 0; payload[at++] = 0; payload[at++] = 0; payload[at++] = 0;
-    frame = make_frame(1, 1, 0, 0xFFFFFFFFu, 0, 0, 0, 1, 0, payload, at);
-    break;
-  case 5: /* declared length does not match the buffer */
-    at = put_string(payload, "x");
-    payload[at++] = 0; payload[at++] = 0; payload[at++] = 0; payload[at++] = 0;
-    frame = make_frame(1, 1, 0, 0xFFFFFFFFu, 0, 0, 0, 0, 1, payload, at);
-    break;
-  case 6: /* line numbers are 1-based */
-    at = put_string(payload, "x");
-    payload[at++] = 0; payload[at++] = 0; payload[at++] = 0; payload[at++] = 0;
-    frame = make_frame(1, 0, 0, 0xFFFFFFFFu, 0, 0, 0, 0, 0, payload, at);
-    break;
-  case 7: /* unknown event tag */
-    at = put_string(payload, "x");
-    payload[at++] = 0; payload[at++] = 0; payload[at++] = 0; payload[at++] = 0;
-    frame = make_frame(8, 1, 0, 0xFFFFFFFFu, 0, 0, 0, 0, 0, payload, at);
-    break;
-  case 8: /* only a start frame carries attribute pairs */
-    at = put_string(payload, "x");
-    frame = make_frame(2, 1, 0, 4u, 1, 0, 0, 0, 0, payload, at);
-    break;
-  case 9: /* invalid UTF-8 in a payload string */
-    payload[0] = 2;
-    payload[1] = 0;
-    payload[2] = 0;
-    payload[3] = 0;
-    payload[4] = (unsigned char)0xC0;
-    payload[5] = (unsigned char)0x80;
-    payload[6] = 0; payload[7] = 0; payload[8] = 0; payload[9] = 0;
-    frame = make_frame(1, 1, 0, 4u, 0, 0, 0, 0, 0, payload, 10);
-    break;
-  case 10: /* header pair count disagrees with the payload */
-    at = put_string(payload, "x");
-    payload[at++] = 0; payload[at++] = 0; payload[at++] = 0; payload[at++] = 0;
-    frame = make_frame(1, 1, 0, 4u, 1, 0, 0, 0, 0, payload, at);
-    break;
-  case 11: /* trailing bytes after an end-element name */
-    at = put_string(payload, "x");
-    payload[at++] = 'Z';
-    frame = make_frame(2, 1, 0, 4u, 0, 0, 0, 0, 0, payload, at);
-    break;
-  case 12: /* the frame-bound refusal path */
-    last_emit = (int)lexpat_cabi_reject_frame(17000000u);
-    last_code = (int)XML_GetErrorCode(P);
-    return;
-  case 13: /* offsets beyond the input budget */
-    at = put_string(payload, "x");
-    payload[at++] = 0; payload[at++] = 0; payload[at++] = 0; payload[at++] = 0;
-    frame = make_frame(1, 1, (uint64_t)8 * 1024 * 1024 + 1, 0xFFFFFFFFu, 0, 0, 0, 0, 0,
-                       payload, at);
-    break;
-  case 14: /* opener beyond the bytes actually fed: four were fed */
-    at = put_string(payload, "x");
-    payload[at++] = 0; payload[at++] = 0; payload[at++] = 0; payload[at++] = 0;
-    frame = make_frame_full(1, 1, 5, 0, 0xFFFFFFFFu, 0, 0, 0, 0, 0, payload, at);
-    break;
-  case 15: /* column beyond the bytes actually fed */
-    at = put_string(payload, "x");
-    payload[at++] = 0; payload[at++] = 0; payload[at++] = 0; payload[at++] = 0;
-    frame = make_frame_full(1, 1, 0, 5, 0xFFFFFFFFu, 0, 0, 0, 0, 0, payload, at);
-    break;
-  case 16: /* token span reaching past the last fed byte */
-    at = put_string(payload, "x");
-    payload[at++] = 0; payload[at++] = 0; payload[at++] = 0; payload[at++] = 0;
-    frame = make_frame_full(1, 1, 0, 0, 5, 0, 0, 0, 0, 0, payload, at);
-    break;
-  case 17: /* a markup token cannot have an empty span */
-    at = put_string(payload, "x");
-    payload[at++] = 0; payload[at++] = 0; payload[at++] = 0; payload[at++] = 0;
-    frame = make_frame_full(1, 1, 0, 0, 0, 0, 0, 0, 0, 0, payload, at);
-    break;
-  case 18: /* line beyond the bytes actually fed */
-    at = put_string(payload, "x");
-    payload[at++] = 0; payload[at++] = 0; payload[at++] = 0; payload[at++] = 0;
-    frame = make_frame_full(1, 6, 0, 0, 0xFFFFFFFFu, 0, 0, 0, 0, 0, payload, at);
-    break;
-  case 19: /* text events report no span */
-    at = put_string(payload, "x");
-    frame = make_frame_full(3, 1, 0, 0, 1, 0, 0, 0, 0, 0, payload, at);
-    break;
-  case 20: /* affirmative control: one pair allocates a 24-byte vector */
-    record_pairs = 1;
-    arm(-1, -1);
-    frame = start_frame_pairs();
-    last_emit = (int)lexpat_cabi_emit_frame(frame);
-    disarm();
-    last_code = (int)XML_GetErrorCode(P);
-    return;
-  case 21: /* an impossible pair count the payload cannot describe */
-    arm(-1, -1);
-    frame = start_frame_count("x", (UINT32_MAX - 1) / 2);
-    last_emit = (int)lexpat_cabi_emit_frame(frame);
-    disarm();
-    last_code = (int)XML_GetErrorCode(P);
-    return;
-  case 22: /* a large count with no pair bytes behind it */
-    arm(-1, -1);
-    frame = start_frame_count("x", 1000u);
-    last_emit = (int)lexpat_cabi_emit_frame(frame);
-    disarm();
-    last_code = (int)XML_GetErrorCode(P);
-    return;
-  case 23: /* the start-name copy fails */
-    arm(0, -1);
-    frame = start_frame("x", 0);
-    last_emit = (int)lexpat_cabi_emit_frame(frame);
-    disarm();
-    last_code = (int)XML_GetErrorCode(P);
-    return;
-  case 24: /* the attribute-vector allocation fails */
-    arm(-1, 0);
-    frame = start_frame_pairs();
-    last_emit = (int)lexpat_cabi_emit_frame(frame);
-    disarm();
-    last_code = (int)XML_GetErrorCode(P);
-    return;
-  case 25: /* the first attribute-name copy fails after the element name */
-    arm(1, -1);
-    frame = start_frame_pairs();
-    last_emit = (int)lexpat_cabi_emit_frame(frame);
-    disarm();
-    last_code = (int)XML_GetErrorCode(P);
-    return;
-  case 26: /* the first attribute-value copy fails after the name copy */
-    arm(2, -1);
-    frame = start_frame_pairs();
-    last_emit = (int)lexpat_cabi_emit_frame(frame);
-    disarm();
-    last_code = (int)XML_GetErrorCode(P);
-    return;
-  case 27: /* the XML declaration version copy fails */
-    arm(0, -1);
-    frame = decl_frame(0);
-    last_emit = (int)lexpat_cabi_emit_frame(frame);
-    disarm();
-    last_code = (int)XML_GetErrorCode(P);
-    return;
-  case 28: /* the end-element name copy fails */
-    arm(0, -1);
-    frame = named_frame(2, "x");
-    last_emit = (int)lexpat_cabi_emit_frame(frame);
-    disarm();
-    last_code = (int)XML_GetErrorCode(P);
-    return;
-  case 29: /* the comment copy fails */
-    arm(0, -1);
-    frame = named_frame(6, "c");
-    last_emit = (int)lexpat_cabi_emit_frame(frame);
-    disarm();
-    last_code = (int)XML_GetErrorCode(P);
-    return;
-  case 30: /* the processing-instruction target copy fails */
-    arm(0, -1);
-    frame = pi_frame();
-    last_emit = (int)lexpat_cabi_emit_frame(frame);
-    disarm();
-    last_code = (int)XML_GetErrorCode(P);
-    return;
-  case 31: /* the XML declaration encoding copy fails after the version */
-    arm(1, -1);
-    frame = decl_frame(1);
-    last_emit = (int)lexpat_cabi_emit_frame(frame);
-    disarm();
-    last_code = (int)XML_GetErrorCode(P);
-    return;
-  default:
-    return;
-  }
-  last_emit = (int)lexpat_cabi_emit_frame(frame);
+static void trigger(void) {
+  triggered = 1;
+  calls = 0;
+  pairs = 0;
+  chars = 0;
+  injecting = 1;
+  last_emit = inject_case(pending_case);
+  injecting = 0;
   last_code = (int)XML_GetErrorCode(P);
 }
 
@@ -2091,22 +1771,50 @@ static void XMLCALL on_start(void *userData, const XML_Char *name,
                              const XML_Char **atts) {
   (void)userData;
   (void)name;
-  calls++;
-  if (record_pairs) {
-    int entries = 0;
-    if (atts != NULL)
-      while (atts[entries] != NULL)
-        entries++;
-    last_pairs = entries / 2;
+  if (!injecting) {
+    if (!triggered)
+      trigger();
+    return;
   }
-  if (injects++ == 0)
-    inject();
+  calls++;
+  if (atts != NULL) {
+    long entries = 0;
+    while (atts[entries] != NULL)
+      entries++;
+    pairs = entries / 2;
+  }
 }
 
 static void XMLCALL on_end(void *userData, const XML_Char *name) {
   (void)userData;
   (void)name;
-  ends++;
+  if (injecting)
+    calls++;
+}
+
+static void XMLCALL on_text(void *userData, const XML_Char *data, int length) {
+  (void)userData;
+  (void)data;
+  if (injecting) {
+    calls++;
+    chars += length;
+  }
+}
+
+static void XMLCALL on_comment(void *userData, const XML_Char *data) {
+  (void)userData;
+  (void)data;
+  if (injecting)
+    calls++;
+}
+
+static void XMLCALL on_pi(void *userData, const XML_Char *target,
+                          const XML_Char *data) {
+  (void)userData;
+  (void)target;
+  (void)data;
+  if (injecting)
+    calls++;
 }
 
 static void XMLCALL on_decl(void *userData, const XML_Char *version,
@@ -2115,91 +1823,182 @@ static void XMLCALL on_decl(void *userData, const XML_Char *version,
   (void)version;
   (void)encoding;
   (void)standalone;
-  decls++;
+  if (injecting)
+    calls++;
 }
 
-static void XMLCALL on_comment(void *userData, const XML_Char *data) {
+static void XMLCALL on_cdata_start(void *userData) {
   (void)userData;
-  (void)data;
-  comments++;
+  if (injecting)
+    calls++;
 }
 
-static void XMLCALL on_pi(void *userData, const XML_Char *target,
-                          const XML_Char *data) {
+static void XMLCALL on_cdata_end(void *userData) {
   (void)userData;
-  (void)target;
-  (void)data;
-  pis++;
+  if (injecting)
+    calls++;
 }
 
-static int handler_calls;
-
-static void XMLCALL counted_start(void *userData, const XML_Char *name,
-                                  const XML_Char **atts) {
-  (void)userData;
-  (void)name;
-  (void)atts;
-  handler_calls++;
+/* Fabricated Lean objects: the receivers own whatever they are handed. */
+static lean_object *mk_bytes(const unsigned char *data, size_t size) {
+  lean_object *array = lean_alloc_sarray(1, size, size);
+  if (size > 0)
+    memcpy(lean_sarray_cptr(array), data, size);
+  return array;
 }
 
-static void XMLCALL counted_end(void *userData, const XML_Char *name) {
-  (void)userData;
-  (void)name;
-  handler_calls++;
+static lean_object *mk_string(const unsigned char *data, size_t size) {
+  return lean_mk_string_from_bytes_unchecked((const char *)data, size);
 }
 
-static void XMLCALL counted_text(void *userData, const XML_Char *data, int length) {
-  (void)userData;
-  (void)data;
-  (void)length;
-  handler_calls++;
+static lean_object *mk_attrs(lean_object *name, lean_object *value) {
+  lean_object *array = lean_alloc_array(1, 1);
+  lean_object *pair = lean_alloc_ctor(0, 2, 0);
+  lean_ctor_set(pair, 0, name);
+  lean_ctor_set(pair, 1, value);
+  lean_array_set_core(array, 0, pair);
+  return array;
 }
 
-static void XMLCALL counted_comment(void *userData, const XML_Char *data) {
-  (void)userData;
-  (void)data;
-  handler_calls++;
+static const unsigned char GOOD[] = "hi";
+static const unsigned char BAD_UTF8[] = {0xC0, 0x80};
+static const unsigned char WITH_NUL[] = {'a', 0x00, 'b'};
+
+static uint64_t inject_case(int which) {
+  switch (which) {
+  case 0: /* affirmative: a well-formed text span reaches the text handler */
+    return lexpat_cabi_emit_text(mk_bytes(GOOD, 2), 0, 2, 0, 0, 1, 0);
+  case 1: /* affirmative: a start tag with one ordered attribute pair */
+    return lexpat_cabi_emit_start(mk_string((const unsigned char *)"x", 1),
+                                  mk_attrs(mk_string((const unsigned char *)"a", 1),
+                                           mk_string((const unsigned char *)"1", 1)),
+                                  0, 1, 0);
+  case 2: /* affirmative: an end tag */
+    return lexpat_cabi_emit_end(mk_string((const unsigned char *)"x", 1), 0, 1, 0);
+  case 3: /* affirmative: a comment */
+    return lexpat_cabi_emit_comment(mk_string((const unsigned char *)"c", 1), 1, 1, 0);
+  case 4: /* affirmative: a processing instruction */
+    return lexpat_cabi_emit_pi(mk_string((const unsigned char *)"p", 1),
+                               mk_string((const unsigned char *)"d", 1), 1, 1, 0);
+  case 5: /* affirmative: CDATA start and end */
+    if (lexpat_cabi_emit_cdata_start(0, 1, 0) != 0)
+      return 1;
+    return lexpat_cabi_emit_cdata_end(2, 1, 0);
+  case 6: /* affirmative: a declaration */
+    return lexpat_cabi_emit_xml_decl(mk_string((const unsigned char *)"1.0", 3),
+                                     mk_string((const unsigned char *)"UTF-8", 5), 1,
+                                     0, 0, 1, 0);
+  case 7: /* affirmative: materialized character data */
+    return lexpat_cabi_emit_text_string(mk_string(GOOD, 2), 1, 1, 0);
+  case 8: /* inverted span */
+    return lexpat_cabi_emit_text(mk_bytes(GOOD, 2), 2, 1, 0, 0, 1, 0);
+  case 9: /* span past the owner */
+    return lexpat_cabi_emit_text(mk_bytes(GOOD, 2), 0, 3, 0, 0, 1, 0);
+  case 10: /* span whose absolute end is past the bytes fed */
+    return lexpat_cabi_emit_text(mk_bytes(GOOD, 2), 0, 2, 3, 0, 1, 0);
+  case 11: /* offset at the fed boundary */
+    return lexpat_cabi_emit_text(mk_bytes(GOOD, 2), 0, 2, 0, 4, 1, 0);
+  case 12: /* line numbers are 1-based */
+    return lexpat_cabi_emit_text(mk_bytes(GOOD, 2), 0, 2, 0, 0, 0, 0);
+  case 13: /* a column cannot pass the fed byte count */
+    return lexpat_cabi_emit_text(mk_bytes(GOOD, 2), 0, 2, 0, 0, 1, 5);
+  case 14: /* a base that would overflow the absolute offset */
+    return lexpat_cabi_emit_text(mk_bytes(GOOD, 2), 1, 2, UINT64_MAX, 0, 1, 0);
+  case 15: /* invalid UTF-8 in a borrowed span */
+    return lexpat_cabi_emit_text(mk_bytes(BAD_UTF8, 2), 0, 2, 0, 0, 1, 0);
+  case 16: /* a NUL inside a borrowed span */
+    return lexpat_cabi_emit_text(mk_bytes(WITH_NUL, 3), 0, 3, 0, 0, 1, 0);
+  case 17: /* invalid UTF-8 in a materialized payload */
+    return lexpat_cabi_emit_text_string(mk_string(BAD_UTF8, 2), 1, 1, 0);
+  case 18: /* invalid UTF-8 in an element name */
+    return lexpat_cabi_emit_start(mk_string(BAD_UTF8, 2), lean_alloc_array(0, 0), 0, 1,
+                                  0);
+  case 19: /* invalid UTF-8 in an attribute value */
+    return lexpat_cabi_emit_start(mk_string((const unsigned char *)"x", 1),
+                                  mk_attrs(mk_string((const unsigned char *)"a", 1),
+                                           mk_string(BAD_UTF8, 2)),
+                                  0, 1, 0);
+  case 20: /* a payload allocation failure */
+    fail_malloc_countdown = 0;
+    return lexpat_cabi_emit_start(mk_string((const unsigned char *)"x", 1),
+                                  lean_alloc_array(0, 0), 0, 1, 0);
+  case 21: /* CDATA start at the fed boundary */
+    return lexpat_cabi_emit_cdata_start(4, 1, 0);
+  case 22: /* an impossible standalone value */
+    return lexpat_cabi_emit_xml_decl(mk_string((const unsigned char *)"1.0", 3),
+                                     lean_mk_string(""), 0, 2, 0, 1, 0);
+  case 23: /* invalid UTF-8 in a declaration encoding */
+    return lexpat_cabi_emit_xml_decl(mk_string((const unsigned char *)"1.0", 3),
+                                     mk_string(BAD_UTF8, 2), 1, -1, 0, 1, 0);
+  case 24: /* affirmative: materialized character data held as owned bytes */
+    return lexpat_cabi_emit_text_bytes(mk_bytes(GOOD, 2), 1, 1, 0);
+  case 25: /* invalid UTF-8 in an owned byte payload */
+    return lexpat_cabi_emit_text_bytes(mk_bytes(BAD_UTF8, 2), 1, 1, 0);
+  case 26: /* a NUL inside an owned byte payload */
+    return lexpat_cabi_emit_text_bytes(mk_bytes(WITH_NUL, 3), 1, 1, 0);
+  default:
+    return 0xFFFFFFFFu;
+  }
 }
 
-static void XMLCALL counted_pi(void *userData, const XML_Char *target,
-                               const XML_Char *data) {
-  (void)userData;
-  (void)target;
-  (void)data;
-  handler_calls++;
-}
+/* Expectations per case. `code` is the parser error after the injection. */
+typedef struct {
+  int emit;
+  int code;
+  long calls;
+  long pairs;
+  long chars;
+} Expect;
 
-static void XMLCALL counted_decl(void *userData, const XML_Char *version,
-                                 const XML_Char *encoding, int standalone) {
-  (void)userData;
-  (void)version;
-  (void)encoding;
-  (void)standalone;
-  handler_calls++;
-}
+static const Expect EXPECTATIONS[] = {
+    [0] = {0, XML_ERROR_NONE, 1, 0, 2},
+    [1] = {0, XML_ERROR_NONE, 1, 1, 0},
+    [2] = {0, XML_ERROR_NONE, 1, 0, 0},
+    [3] = {0, XML_ERROR_NONE, 1, 0, 0},
+    [4] = {0, XML_ERROR_NONE, 1, 0, 0},
+    [5] = {0, XML_ERROR_NONE, 2, 0, 0},
+    [6] = {0, XML_ERROR_NONE, 1, 0, 0},
+    [7] = {0, XML_ERROR_NONE, 1, 0, 2},
+    [8] = {1, XML_ERROR_MALFORMED_WIRE, 0, 0, 0},
+    [9] = {1, XML_ERROR_MALFORMED_WIRE, 0, 0, 0},
+    [10] = {1, XML_ERROR_MALFORMED_WIRE, 0, 0, 0},
+    [11] = {1, XML_ERROR_MALFORMED_WIRE, 0, 0, 0},
+    [12] = {1, XML_ERROR_MALFORMED_WIRE, 0, 0, 0},
+    [13] = {1, XML_ERROR_MALFORMED_WIRE, 0, 0, 0},
+    [14] = {1, XML_ERROR_MALFORMED_WIRE, 0, 0, 0},
+    [15] = {1, XML_ERROR_MALFORMED_WIRE, 0, 0, 0},
+    [16] = {1, XML_ERROR_MALFORMED_WIRE, 0, 0, 0},
+    [17] = {1, XML_ERROR_MALFORMED_WIRE, 0, 0, 0},
+    [18] = {1, XML_ERROR_MALFORMED_WIRE, 0, 0, 0},
+    [19] = {1, XML_ERROR_MALFORMED_WIRE, 0, 0, 0},
+    [20] = {1, XML_ERROR_NO_MEMORY, 0, 0, 0},
+    [21] = {1, XML_ERROR_MALFORMED_WIRE, 0, 0, 0},
+    [22] = {1, XML_ERROR_MALFORMED_WIRE, 0, 0, 0},
+    [23] = {1, XML_ERROR_MALFORMED_WIRE, 0, 0, 0},
+    [24] = {0, XML_ERROR_NONE, 1, 0, 2},
+    [25] = {1, XML_ERROR_MALFORMED_WIRE, 0, 0, 0},
+    [26] = {1, XML_ERROR_MALFORMED_WIRE, 0, 0, 0},
+};
 
-/* Every event kind, with no handler first and all handlers second. The first
- * parse must validate the frames without allocating a payload copy; the
- * second is the affirmative control that the counter observes the shim's
- * copies at all. */
+/* Every event kind with no handler first, then with all handlers: the first
+ * parse must not allocate any payload copy, the second is the affirmative
+ * control that the counter sees the receiver's copies at all. */
 static int check_unhandled_allocations(void) {
   static const char document[] =
-      "<?xml version=\"1.0\"?><!--c--><?pi d?><r a=\"1\"/>";
+      "<?xml version=\"1.0\"?><!--c--><?pi d?><r a=\"1\"><s><![CDATA[x]]></s></r>";
   int failures = 0;
   XML_Parser parser = XML_ParserCreate(NULL);
-  enum XML_Status status;
   if (parser == NULL) {
-    fputs("wire: cannot create a parser\n", stderr);
+    fputs("bridge: cannot create a parser\n", stderr);
     return 1;
   }
   counting = 1;
   allocations = 0;
-  status = XML_Parse(parser, document, (int)strlen(document), 1);
+  enum XML_Status status = XML_Parse(parser, document, (int)strlen(document), 1);
   counting = 0;
   long unhandled = allocations;
   if (status != XML_STATUS_OK || unhandled != 0) {
-    fprintf(stderr,
-            "wire: unhandled events allocated %ld payload copies (status %d)\n",
+    fprintf(stderr, "bridge: unhandled events allocated %ld payload copies (status %d)\n",
             unhandled, (int)status);
     failures++;
   }
@@ -2207,143 +2006,91 @@ static int check_unhandled_allocations(void) {
 
   parser = XML_ParserCreate(NULL);
   if (parser == NULL) {
-    fputs("wire: cannot create a parser\n", stderr);
+    fputs("bridge: cannot create a parser\n", stderr);
     return failures + 1;
   }
-  handler_calls = 0;
-  XML_SetElementHandler(parser, counted_start, counted_end);
-  XML_SetCharacterDataHandler(parser, counted_text);
-  XML_SetCommentHandler(parser, counted_comment);
-  XML_SetProcessingInstructionHandler(parser, counted_pi);
-  XML_SetXmlDeclHandler(parser, counted_decl);
+  triggered = 1; /* do not inject during this control */
+  injecting = 1; /* count every callback the control document produces */
+  XML_SetElementHandler(parser, on_start, on_end);
+  XML_SetCharacterDataHandler(parser, on_text);
+  XML_SetCommentHandler(parser, on_comment);
+  XML_SetProcessingInstructionHandler(parser, on_pi);
+  XML_SetXmlDeclHandler(parser, on_decl);
+  XML_SetCdataSectionHandler(parser, on_cdata_start, on_cdata_end);
+  calls = 0;
   counting = 1;
   allocations = 0;
   status = XML_Parse(parser, document, (int)strlen(document), 1);
   counting = 0;
-  if (status != XML_STATUS_OK || allocations == 0 || handler_calls != 5) {
+  injecting = 0;
+  if (status != XML_STATUS_OK || allocations == 0 || calls == 0) {
     fprintf(stderr,
-            "wire: handler control saw %ld allocations and %d callbacks (status %d)\n",
-            allocations, handler_calls, (int)status);
+            "bridge: handler control saw %ld allocations and %ld callbacks (status %d)\n",
+            allocations, calls, (int)status);
     failures++;
   }
-  printf("wire: unhandled events allocated %ld payload copies; "
-         "handler control allocated %ld\n", unhandled, allocations);
+  printf("bridge: unhandled events allocated %ld payload copies; handler control "
+         "allocated %ld\n", unhandled, allocations);
   XML_ParserFree(parser);
   return failures;
 }
 
-/* Per-frame expectations. `last_calloc` of 0 means "not asserted"; every other
- * field is exact. `oversized_calloc` must stay zero: a frame the wire format
- * can describe never justifies an allocation above the wrapper's cap. */
-typedef struct {
-  int emit;
-  int code;
-  int calls;
-  int ends;
-  int decls;
-  int comments;
-  int pis;
-  int calloc_calls;
-  size_t last_calloc;
-} Expect;
-
-static const Expect EXPECTATIONS[32] = {
-    [0] = {0, XML_ERROR_NONE, 2, 1, 0, 0, 0, 0, 0},
-    [1] = {1, XML_ERROR_MALFORMED_WIRE, 1, 0, 0, 0, 0, 0, 0},
-    [2] = {1, XML_ERROR_MALFORMED_WIRE, 1, 0, 0, 0, 0, 0, 0},
-    [3] = {1, XML_ERROR_MALFORMED_WIRE, 1, 0, 0, 0, 0, 0, 0},
-    [4] = {1, XML_ERROR_MALFORMED_WIRE, 1, 0, 0, 0, 0, 0, 0},
-    [5] = {1, XML_ERROR_MALFORMED_WIRE, 1, 0, 0, 0, 0, 0, 0},
-    [6] = {1, XML_ERROR_MALFORMED_WIRE, 1, 0, 0, 0, 0, 0, 0},
-    [7] = {1, XML_ERROR_MALFORMED_WIRE, 1, 0, 0, 0, 0, 0, 0},
-    [8] = {1, XML_ERROR_MALFORMED_WIRE, 1, 0, 0, 0, 0, 0, 0},
-    [9] = {1, XML_ERROR_MALFORMED_WIRE, 1, 0, 0, 0, 0, 0, 0},
-    [10] = {1, XML_ERROR_MALFORMED_WIRE, 1, 0, 0, 0, 0, 0, 0},
-    [11] = {1, XML_ERROR_MALFORMED_WIRE, 1, 0, 0, 0, 0, 0, 0},
-    [12] = {1, XML_ERROR_LIMIT_TOKEN, 1, 0, 0, 0, 0, 0, 0},
-    [13] = {1, XML_ERROR_MALFORMED_WIRE, 1, 0, 0, 0, 0, 0, 0},
-    [14] = {1, XML_ERROR_MALFORMED_WIRE, 1, 0, 0, 0, 0, 0, 0},
-    [15] = {1, XML_ERROR_MALFORMED_WIRE, 1, 0, 0, 0, 0, 0, 0},
-    [16] = {1, XML_ERROR_MALFORMED_WIRE, 1, 0, 0, 0, 0, 0, 0},
-    [17] = {1, XML_ERROR_MALFORMED_WIRE, 1, 0, 0, 0, 0, 0, 0},
-    [18] = {1, XML_ERROR_MALFORMED_WIRE, 1, 0, 0, 0, 0, 0, 0},
-    [19] = {1, XML_ERROR_MALFORMED_WIRE, 1, 0, 0, 0, 0, 0, 0},
-    [20] = {0, XML_ERROR_NONE, 2, 1, 0, 0, 0, 1, 24},
-    [21] = {1, XML_ERROR_MALFORMED_WIRE, 1, 0, 0, 0, 0, 0, 0},
-    [22] = {1, XML_ERROR_MALFORMED_WIRE, 1, 0, 0, 0, 0, 0, 0},
-    [23] = {1, XML_ERROR_NO_MEMORY, 1, 0, 0, 0, 0, 0, 0},
-    [24] = {1, XML_ERROR_NO_MEMORY, 1, 0, 0, 0, 0, 1, 0},
-    [25] = {1, XML_ERROR_NO_MEMORY, 1, 0, 0, 0, 0, 1, 0},
-    [26] = {1, XML_ERROR_NO_MEMORY, 1, 0, 0, 0, 0, 1, 0},
-    [27] = {1, XML_ERROR_NO_MEMORY, 1, 0, 0, 0, 0, 0, 0},
-    [28] = {1, XML_ERROR_NO_MEMORY, 1, 0, 0, 0, 0, 0, 0},
-    [29] = {1, XML_ERROR_NO_MEMORY, 1, 0, 0, 0, 0, 0, 0},
-    [30] = {1, XML_ERROR_NO_MEMORY, 1, 0, 0, 0, 0, 0, 0},
-    [31] = {1, XML_ERROR_NO_MEMORY, 1, 0, 0, 0, 0, 0, 0},
-};
-
 int main(void) {
   int failures = 0;
-  for (which = 0; which <= 31; which++) {
-    const Expect *want = &EXPECTATIONS[which];
-    enum XML_Status status;
-    enum XML_Error code;
+  size_t count = sizeof(EXPECTATIONS) / sizeof(EXPECTATIONS[0]);
+  for (pending_case = 0; (size_t)pending_case < count; pending_case++) {
+    const Expect *want = &EXPECTATIONS[pending_case];
     enum XML_Status want_status =
         want->code == XML_ERROR_NONE ? XML_STATUS_OK : XML_STATUS_ERROR;
     P = XML_ParserCreate(NULL);
     if (P == NULL) {
-      fputs("wire: cannot create a parser\n", stderr);
+      fputs("bridge: cannot create a parser\n", stderr);
       return 2;
     }
+    triggered = 0;
+    injecting = 0;
     calls = 0;
-    ends = 0;
-    decls = 0;
-    comments = 0;
-    pis = 0;
-    injects = 0;
-    record_pairs = 0;
-    last_pairs = -1;
-    last_emit = -1;
+    pairs = 0;
+    chars = 0;
+    last_emit = 0xFFFFFFFFu;
     last_code = -1;
-    injected_failures = 0;
     XML_SetElementHandler(P, on_start, on_end);
-    XML_SetXmlDeclHandler(P, on_decl);
+    XML_SetCharacterDataHandler(P, on_text);
     XML_SetCommentHandler(P, on_comment);
     XML_SetProcessingInstructionHandler(P, on_pi);
-    status = XML_Parse(P, "<r/>", 4, 1);
-    code = XML_GetErrorCode(P);
-    if (status != want_status || code != (enum XML_Error)want->code
-        || last_emit != want->emit
-        || last_code != want->code || calls != want->calls || ends != want->ends
-        || decls != want->decls || comments != want->comments || pis != want->pis
-        || calloc_calls != want->calloc_calls || oversized_calloc != 0
-        || (want->last_calloc != 0 && last_calloc != want->last_calloc)) {
+    XML_SetXmlDeclHandler(P, on_decl);
+    XML_SetCdataSectionHandler(P, on_cdata_start, on_cdata_end);
+    enum XML_Status status = XML_Parse(P, "<r/>", 4, 1);
+    if (status != want_status || last_code != want->code ||
+        last_emit != (uint64_t)want->emit || calls != want->calls ||
+        pairs != want->pairs || chars != want->chars) {
       fprintf(stderr,
-              "wire: case %d failed (status %d/%d code %d/%d emit %d/%d "
-              "callbacks calls %d/%d ends %d/%d decls %d/%d comments %d/%d "
-              "pis %d/%d calloc %d/%d size %lu/%lu oversized %d request %llu)\n",
-              which, (int)status, (int)want_status, (int)code, want->code,
-              last_emit, want->emit, calls, want->calls, ends, want->ends, decls,
-              want->decls, comments, want->comments, pis, want->pis, calloc_calls,
-              want->calloc_calls, (unsigned long)last_calloc,
-              (unsigned long)want->last_calloc, oversized_calloc, oversized_request);
-      failures++;
-    }
-    if (which == 20 && last_pairs != 1) {
-      fprintf(stderr, "wire: pair control saw %d attribute pairs, want 1\n",
-              last_pairs);
+              "bridge: case %d failed (status %d/%d code %d/%d emit %" PRIu64
+              "/%d calls %ld/%ld pairs %ld/%ld chars %ld/%ld)\n",
+              pending_case, (int)status, (int)want_status, last_code, want->code,
+              last_emit, want->emit, calls, want->calls, pairs, want->pairs, chars,
+              want->chars);
       failures++;
     }
     XML_ParserFree(P);
   }
+
+  /* Outside a parse there is no current parser: a receiver must refuse without
+   * touching one. */
+  if (lexpat_cabi_emit_text(mk_bytes(GOOD, 2), 0, 2, 0, 0, 1, 0) != 1) {
+    fputs("bridge: a receiver without a current parser did not refuse\n", stderr);
+    failures++;
+  }
+
   failures += check_unhandled_allocations();
   if (failures != 0) {
-    fprintf(stderr, "verify: wire: %d cases failed\n", failures);
+    fprintf(stderr, "verify: bridge: %d checks failed\n", failures);
     return 1;
   }
-  printf("PASS wire (32 frames; impossible pair counts allocate nothing, "
-         "shim allocation failures report NO_MEMORY, malformed frames terminate "
-         "only their parser, unhandled events allocate no payload copy)\n");
+  printf("PASS bridge (%zu direct receiver controls; malformed spans and payloads "
+         "refuse before any callback, shim allocation failures report NO_MEMORY, "
+         "a receiver without a parser does nothing, unhandled events allocate no "
+         "payload copy)\n", count);
   return 0;
 }
 """
@@ -2641,6 +2388,251 @@ int main(void) {
 }
 """
 
+LOADER_SOURCE = r"""
+/*
+ * One fresh-process loader client for `tests/c-abi-verify.py --abi`. It resolves
+ * the shipped artifact through the real dynamic loader, parses one known
+ * document with registered element and character-data handlers, frees the
+ * parser, closes the handle and exits. Each failing step returns its own status.
+ * An optional delay in milliseconds keeps the process alive after the handle is
+ * closed, so the deadline control can observe an active child.
+ */
+#define _POSIX_C_SOURCE 200809L
+#include <dlfcn.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+#include <expat.h>
+
+static int elements;
+static int text_bytes;
+
+static void XMLCALL on_start_element(void *userData, const XML_Char *name,
+                                     const XML_Char **atts) {
+  (void)userData;
+  (void)atts;
+  if (strcmp(name, "root") == 0)
+    elements++;
+}
+
+static void XMLCALL on_character_data(void *userData, const XML_Char *text,
+                                      int len) {
+  (void)userData;
+  (void)text;
+  if (len > 0)
+    text_bytes += len;
+}
+
+static void delay_milliseconds(int milliseconds) {
+  struct timespec span;
+  span.tv_sec = milliseconds / 1000;
+  span.tv_nsec = (long)(milliseconds % 1000) * 1000000L;
+  while (nanosleep(&span, &span) != 0)
+    ;
+}
+
+int main(int argc, char **argv) {
+  static const char document[] = "<root>hello</root>";
+  int delay_ms = 0;
+  void *handle;
+  XML_Parser parser;
+  int status;
+  typedef XML_Parser (*create_fn)(const XML_Char *);
+  typedef void (*set_element_fn)(XML_Parser, XML_StartElementHandler,
+                                 XML_EndElementHandler);
+  typedef void (*set_text_fn)(XML_Parser, XML_CharacterDataHandler);
+  typedef int (*parse_fn)(XML_Parser, const char *, int, int);
+  typedef void (*free_fn)(XML_Parser);
+  create_fn create;
+  set_element_fn set_element;
+  set_text_fn set_text;
+  parse_fn parse;
+  free_fn destroy;
+
+  if (argc < 2 || argc > 3) {
+    fprintf(stderr, "usage: %s <library> [delay-ms]\n", argv[0]);
+    return 2;
+  }
+  if (argc == 3)
+    delay_ms = atoi(argv[2]);
+
+  handle = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
+  if (handle == NULL) {
+    fprintf(stderr, "dlopen: %s\n", dlerror());
+    return 10;
+  }
+  create = (create_fn)dlsym(handle, "XML_ParserCreate");
+  set_element = (set_element_fn)dlsym(handle, "XML_SetElementHandler");
+  set_text = (set_text_fn)dlsym(handle, "XML_SetCharacterDataHandler");
+  parse = (parse_fn)dlsym(handle, "XML_Parse");
+  destroy = (free_fn)dlsym(handle, "XML_ParserFree");
+  if (create == NULL || set_element == NULL || set_text == NULL ||
+      parse == NULL || destroy == NULL) {
+    fprintf(stderr, "dlsym: %s\n", dlerror());
+    return 11;
+  }
+
+  parser = create(NULL);
+  if (parser == NULL) {
+    fprintf(stderr, "XML_ParserCreate returned NULL\n");
+    return 12;
+  }
+  set_element(parser, on_start_element, NULL);
+  set_text(parser, on_character_data);
+  status = parse(parser, document, (int)(sizeof document - 1), 1);
+  destroy(parser);
+  if (status != XML_STATUS_OK) {
+    fprintf(stderr, "XML_Parse status %d\n", status);
+    return 13;
+  }
+  if (elements != 1 || text_bytes != 5) {
+    fprintf(stderr, "callbacks: elements=%d text_bytes=%d\n", elements,
+            text_bytes);
+    return 14;
+  }
+  if (dlclose(handle) != 0) {
+    fprintf(stderr, "dlclose: %s\n", dlerror());
+    return 15;
+  }
+  if (delay_ms > 0)
+    delay_milliseconds(delay_ms);
+  printf("parse ok elements=%d text_bytes=%d\n", elements, text_bytes);
+  return 0;
+}
+"""
+
+LOADER_CHILDREN = 16
+LOADER_CHILD_SECONDS = 15.0
+LOADER_DEADLINE_SECONDS = 60.0
+
+
+def dynamic_entries(path, tag):
+    """Every value `readelf -d` prints for one dynamic `tag`, in file order."""
+    result = run(["readelf", "-d", str(path)])
+    need(result.returncode == 0, f"readelf -d failed for {path}:\n{result.stderr}")
+    marker = f"({tag})"
+    values = []
+    for line in result.stdout.splitlines():
+        if marker in line:
+            values.append(line.split(marker, 1)[1].strip())
+    return values
+
+
+def flags1_words(path):
+    """The `FLAGS_1` flag words of `path`; the detector for `DF_1_NODELETE`.
+
+    `NODELETE` is a word of that entry, not a substring of the whole dynamic
+    section, so an unrelated text occurrence cannot satisfy the check.
+    """
+    entries = dynamic_entries(path, "FLAGS_1")
+    need(len(entries) == 1,
+         f"{path} has {len(entries)} FLAGS_1 dynamic entries, expected exactly one")
+    entry = entries[0]
+    if entry.startswith("Flags:"):
+        entry = entry[len("Flags:"):]
+    return set(entry.split())
+
+
+class LoaderTimeout(VerifyError):
+    """A loader run that exceeded its aggregate deadline or a child bound."""
+
+    def __init__(self, message, launches, reaped, deadline_seconds):
+        super().__init__(message)
+        self.launches = launches
+        self.reaped = reaped
+        self.deadline_seconds = deadline_seconds
+
+
+class LoaderSmoke:
+    """Fresh-process loader runs bounded by one monotonic aggregate deadline.
+
+    The deadline starts immediately before the client is compiled and covers
+    every child, so the measurement includes compilation. Each child is also
+    bounded on its own. Before each step the runner uses the remaining aggregate
+    time, and for a child the smaller of that time and the child bound; a step
+    that passes its bound is terminated, reaped and reported, and no child is
+    ever launched once the deadline has passed.
+    """
+
+    def __init__(self, tmp, library, children, deadline_seconds):
+        self.tmp = tmp
+        self.library = library
+        self.children = children
+        self.deadline_seconds = deadline_seconds
+        self.deadline = time.monotonic() + deadline_seconds
+        self.launches = 0
+        self.executable = None
+
+    def remaining(self):
+        return self.deadline - time.monotonic()
+
+    def deadline_note(self, launched):
+        return (f"the {self.deadline_seconds:g}s aggregate loader deadline passed after "
+                f"{launched} of {self.children} children")
+
+    def compile_client(self):
+        remaining = self.remaining()
+        if remaining <= 0:
+            raise LoaderTimeout(self.deadline_note(self.launches), self.launches,
+                                True, self.deadline_seconds)
+        source = self.tmp / "c-abi-loader.c"
+        source.write_text(LOADER_SOURCE, encoding="utf-8")
+        executable = self.tmp / "c-abi-loader"
+        args = ["cc", "-std=c11", "-Wall", "-Wextra", "-Werror",
+                f"-I{ROOT / 'include'}", str(source), "-ldl", "-o", str(executable)]
+        try:
+            result = run(args, timeout=remaining)
+        except subprocess.TimeoutExpired:
+            raise LoaderTimeout(
+                self.deadline_note(self.launches) + " while compiling the loader client",
+                self.launches, True, self.deadline_seconds)
+        need(result.returncode == 0,
+             "the loader client does not build:\n" + result.stderr)
+        self.executable = executable
+        return executable
+
+    def run(self, delay_ms=0):
+        need(self.executable is not None, "the loader client was not compiled")
+        for index in range(1, self.children + 1):
+            remaining = self.remaining()
+            if remaining <= 0:
+                raise LoaderTimeout(self.deadline_note(self.launches),
+                                    self.launches, True, self.deadline_seconds)
+            bound = min(remaining, LOADER_CHILD_SECONDS)
+            args = [str(self.executable), str(self.library)]
+            if delay_ms:
+                args.append(str(delay_ms))
+            started = time.monotonic()
+            process = subprocess.Popen(args, stdout=subprocess.PIPE,
+                                       stderr=subprocess.PIPE, text=True)
+            self.launches += 1
+            try:
+                out, err = process.communicate(timeout=bound)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.communicate()
+                reaped = process.poll() is not None
+                which = ("aggregate loader deadline"
+                         if remaining < LOADER_CHILD_SECONDS
+                         else f"{LOADER_CHILD_SECONDS:g}s child bound")
+                raise LoaderTimeout(
+                    f"loader child {index}/{self.children} (pid {process.pid}) passed "
+                    f"the {which} {bound:.3f}s after launch; it was terminated "
+                    f"({'reaped' if reaped else 'not reaped'}), and no further child was "
+                    f"launched ({self.launches} of {self.children} started)",
+                    self.launches, reaped, self.deadline_seconds)
+            elapsed = time.monotonic() - started
+            need(process.returncode == 0,
+                 f"loader child {index}/{self.children} exited {process.returncode}: "
+                 + (err.strip() or "(no stderr)"))
+            need("parse ok" in out,
+                 f"loader child {index}/{self.children} reported no affirmative parse: "
+                 + (out.strip() or "(no stdout)"))
+            print(f"  loader child {index}/{self.children} pid {process.pid} exit 0 "
+                  f"in {elapsed:.3f}s: {out.strip()}")
+
 
 def build_artifact(no_build):
     if no_build:
@@ -2683,8 +2675,9 @@ def candidate_link_flags():
 
 
 class Checks:
-    def __init__(self, tmp):
+    def __init__(self, tmp, base_lib=None):
         self.tmp = tmp
+        self.base_lib = base_lib
         self.group = None
 
     def pass_group(self, message):
@@ -2882,6 +2875,35 @@ class Checks:
         need(lean_libdir, "lean --print-libdir produced no path")
         need(lean_libdir in readelf.stdout, "the Lean runtime directory is not in RUNPATH")
 
+        # The initialized Lean runtime starts threads whose code lives in the
+        # runtime libraries and that have no stop or join path. `DF_1_NODELETE`
+        # is what keeps those libraries mapped after the caller's `dlclose`,
+        # so the flag is part of the supported lifetime, not an incidental one.
+        candidate_flags = flags1_words(LIB)
+        need("NODELETE" in candidate_flags,
+             "the shipped artifact's FLAGS_1 entry is "
+             f"{' '.join(sorted(candidate_flags)) or '(empty)'}, not NODELETE: "
+             "dlclose would unload the initialized Lean runtime")
+
+        base_note = ""
+        if self.base_lib is not None:
+            base_flags = flags1_words(self.base_lib)
+            need("NODELETE" not in base_flags,
+                 f"the base artifact already carries NODELETE "
+                 f"({' '.join(sorted(base_flags)) or '(empty)'}), so the detector "
+                 "cannot show that the shipped flag is the change")
+            for tag in ("SONAME", "NEEDED", "RUNPATH"):
+                base_values = dynamic_entries(self.base_lib, tag)
+                candidate_values = dynamic_entries(LIB, tag)
+                need(base_values == candidate_values,
+                     f"{tag} differs between the base artifact {base_values} and the "
+                     f"candidate {candidate_values}")
+            base_note = (f"; the same FLAGS_1 detector found NODELETE absent on "
+                         f"{self.base_lib} and present here, with unchanged "
+                         "SONAME/NEEDED/RUNPATH")
+            print(f"  FLAGS_1 detector: base {' '.join(sorted(base_flags)) or '(empty)'} "
+                  f"-> candidate {' '.join(sorted(candidate_flags))}")
+
         ldd = run(["ldd", str(LIB)])
         need(ldd.returncode == 0, "ldd failed:\n" + ldd.stderr)
         need("not found" not in ldd.stdout, "an unresolved dependency is reported:\n"
@@ -2899,8 +2921,52 @@ class Checks:
              "the loader did not load libleanshared.so")
         need("error:" not in debug.stderr.lower(),
              "the dynamic loader reported an error:\n" + debug.stderr[-2000:])
+
+        smoke = LoaderSmoke(self.tmp, LIB, LOADER_CHILDREN, LOADER_DEADLINE_SECONDS)
+        smoke.compile_client()
+        print(f"  loader smoke: {LOADER_CHILDREN} fresh processes, "
+              f"{LOADER_CHILD_SECONDS:g}s each, {LOADER_DEADLINE_SECONDS:g}s aggregate "
+              "including client compilation")
+        try:
+            smoke.run()
+        except LoaderTimeout as exc:
+            raise VerifyError(str(exc)) from exc
+        elapsed = LOADER_DEADLINE_SECONDS - smoke.remaining()
+        need(elapsed < LOADER_DEADLINE_SECONDS,
+             f"the loader smoke finished at {elapsed:.3f}s, not inside its "
+             f"{LOADER_DEADLINE_SECONDS:g}s aggregate deadline")
+        print(f"  loader smoke: {smoke.launches} children passed in {elapsed:.3f}s")
+        self.loader_control()
         self.pass_group("exact XML_* export allowlist, absent Expat extension symbol, "
-                        "SONAME/NEEDED/RUNPATH and a real loader launch")
+                        "SONAME/NEEDED/RUNPATH, a real loader launch, the FLAGS_1 "
+                        "NODELETE runtime retention and 16 bounded fresh-process "
+                        "load/parse/free/close clients" + base_note)
+
+    def loader_control(self):
+        """Prove the aggregate-deadline branch fails, reaps and stops launching.
+
+        The client is already built, so this control spends no time on
+        compilation: a child that stays alive past a deliberately short deadline
+        must produce a nonzero outcome, the active child must be terminated and
+        reaped, and no second child may be started.
+        """
+        control = LoaderSmoke(self.tmp, LIB, 3, 0.5)
+        control.executable = self.tmp / "c-abi-loader"
+        try:
+            control.run(delay_ms=3000)
+        except LoaderTimeout as exc:
+            need(exc.launches == 1,
+                 f"control: {exc.launches} children were launched after the aggregate "
+                 "deadline, expected only the one already running")
+            need(exc.reaped, "control: the active child was not terminated and reaped")
+            need("aggregate loader deadline" in str(exc),
+                 f"control: the failure was not the aggregate deadline: {exc}")
+            print("  loader control: a 3s child under a 0.5s aggregate deadline failed "
+                  f"as expected after {exc.launches} launch with the child reaped")
+            return
+        raise VerifyError(
+            "control: a child that outlives the aggregate deadline did not fail the "
+            "loader run")
 
     # -- runtime groups ----------------------------------------------------
 
@@ -2922,8 +2988,8 @@ class Checks:
         need(output.returncode == 0,
              f"runtime group {group} failed with status {output.returncode}")
 
-    def wire(self):
-        self.group = "wire"
+    def bridge(self):
+        self.group = "bridge"
         build_artifact(False)
         lean_libdir = run(["lean", "--print-libdir"]).stdout.strip()
         need(lean_libdir, "lean --print-libdir produced no path")
@@ -2931,9 +2997,9 @@ class Checks:
             path for path in (ROOT / ".lake" / "build" / "ir" / "LexPat").rglob("*.c.o.export")
             if "Exe" not in path.parts)
         need(objects, "no Lean module objects were found; run lake build lexpatCAbi")
-        source = self.tmp / "c-abi-wire.c"
-        source.write_text(WIRE_SOURCE, encoding="utf-8")
-        executable = self.tmp / "c-abi-wire"
+        source = self.tmp / "c-abi-bridge.c"
+        source.write_text(BRIDGE_SOURCE, encoding="utf-8")
+        executable = self.tmp / "c-abi-bridge"
         args = ["cc", "-std=c11", "-Wall", "-Wextra", "-Werror",
                 f"-I{ROOT / 'include'}",
                 f"-I{Path(lean_libdir).parent.parent / 'include'}",
@@ -2944,11 +3010,11 @@ class Checks:
                  f"-Wl,-rpath,{lean_libdir}", "-o", str(executable)]
         result = run(args)
         need(result.returncode == 0,
-             "the wire test target does not link:\n" + result.stderr)
+             "the bridge test target does not link:\n" + result.stderr)
         output = run([str(executable)])
         sys.stdout.write(output.stdout)
         sys.stderr.write(output.stderr)
-        need(output.returncode == 0, "the wire checks failed")
+        need(output.returncode == 0, "the bridge checks failed")
 
     # -- docs --------------------------------------------------------------
 
@@ -3077,8 +3143,21 @@ class Checks:
             need(snippet in workflow, f"CI omits the step: {snippet}")
         need("fetch-depth: 0" in workflow,
              "CI does not fetch the base revision for the corpus comparison")
-        need("timeout --signal=TERM --kill-after=5s 300s" in workflow,
+        # The security step is bounded by the process-group wrapper, which is
+        # invoked outside `nix develop` so its 300-second deadline includes Nix
+        # startup, and a failed preparation or security step uploads its logs.
+        need("          python3 scripts/run-bounded-security.py" in workflow,
+             "CI does not run the security step through the process-group wrapper")
+        need("--seconds 300" in workflow,
              "CI does not apply the 300-second outer cap to the security step")
+        need("prepare the fuzz build" in workflow,
+             "CI does not prepare the fuzz build in its own capped step")
+        need("if: failure()" in workflow and "lexpat-security-diagnostics" in workflow,
+             "CI does not retain security diagnostics on failure")
+        need("if-no-files-found: error" in workflow,
+             "CI does not require the security diagnostics artifact to be non-empty")
+        need("--phase smoke" in workflow,
+             "CI does not run the correctness-only performance smoke")
         order = [
             "run: nix develop -c lake build",
             "run: nix develop -c bash tests/clean-build.sh",
@@ -3116,6 +3195,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--no-build", action="store_true",
                         help="use the existing .lake/build/lib/liblexpat.so.1")
+    parser.add_argument("--base-lib", type=Path, default=None,
+                        help="absolute path to a pre-change liblexpat.so.1 whose "
+                             "FLAGS_1 entry must lack NODELETE; meaningful only "
+                             "with --abi")
     for group in GROUPS:
         parser.add_argument(f"--{group}", action="store_true",
                             help=f"run only the {group} checks")
@@ -3125,11 +3208,21 @@ def main():
     if not selected:
         selected = GROUPS
 
+    base_lib = args.base_lib
+    if base_lib is not None:
+        need(args.abi, "--base-lib is meaningful only with --abi")
+        need(base_lib.is_absolute(), f"--base-lib must be an absolute path: {base_lib}")
+        need(base_lib.is_file(), f"--base-lib does not exist: {base_lib}")
+        need(os.access(base_lib, os.R_OK), f"--base-lib is not readable: {base_lib}")
+        need(base_lib.resolve() != LIB.resolve(),
+             "--base-lib names the candidate artifact itself; a base comparison needs "
+             "the artifact from before the change")
+
     build_artifact(args.no_build)
     runtime_groups = {"identity", "lifecycle", "buffers", "errors", "locations",
                       "unsupported", "adversarial"}
     with tempfile.TemporaryDirectory(prefix="lexpat-cabi-verify-", dir="/tmp") as tmp_name:
-        checks = Checks(Path(tmp_name))
+        checks = Checks(Path(tmp_name), base_lib)
         try:
             for group in selected:
                 if group == "header":
@@ -3140,8 +3233,8 @@ def main():
                     checks.layout()
                 elif group in runtime_groups:
                     checks.runtime(group)
-                elif group == "wire":
-                    checks.wire()
+                elif group == "bridge":
+                    checks.bridge()
                 elif group == "docs":
                     checks.docs()
             print(f"OK: {len(selected)} C ABI check groups passed")

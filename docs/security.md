@@ -30,10 +30,11 @@ from that new parser. These are caller obligations, not parser checks.
 | one name, attribute value, text, comment, CDATA, PI accumulation or numeric-reference digit run | 1 MiB (1048576) decoded characters | `LIMIT_TOKEN` |
 | open elements | 256 | `LIMIT_DEPTH` |
 | cumulative reference expansion | 1 MiB (1048576) characters | `LIMIT_ENTITY_EXPANSION` |
-| internal event frame | 16 MiB | `LIMIT_TOKEN` or malformed-wire refusal |
+| one callback payload | 16 MiB logical bytes | malformed-metadata refusal |
 
 There is no separate public attribute-count budget; the count is bounded by the
-raw-input and frame sizes, and its cost is measured rather than declared zero.
+raw input and by the per-callback payload ceiling, and its cost is measured
+rather than declared zero.
 The exact-boundary and boundary-plus-one cases live in `tests/corpus/cases.json`
 and the new security set; see `docs/compatibility.md`.
 
@@ -82,16 +83,35 @@ Lean/libuv startup makes a one-time non-shim allocation; the wrapper's free
 ledger and Valgrind over executed release-client paths are the cleanup
 detectors.
 
-## Internal frame decoding
+## Direct callback payloads
 
-The wire decoder runs inside the artifact and is not reachable through a public
-caller. Beyond validating the header, source metadata and UTF-8 payloads, it now
-rejects an attribute pair count the remaining payload cannot describe
-(`pairs > (payload->size - payload->pos) / 8`) before allocating a vector, and
-it classifies a failed callback copy as `XML_ERROR_NO_MEMORY` while malformed
-payload, header and UTF-8 remain `XML_ERROR_MALFORMED_WIRE`. A fabricated frame
-is exercised only by the direct-linked test target, which records the vector
-allocation and refuses a request above a fixed cap.
+The receivers run inside the artifact and are not reachable through a public
+caller: the version script exports only the `XML_*` surface, and the receivers
+are private symbols the Lean producer calls. A receiver checks a borrowed
+character-data span against the owning chunk and the bytes fed so far, and
+rejects an inverted span, a span beyond the owner, an absolute offset beyond
+the fed window, an impossible line or column, a payload above the 16 MiB
+logical ceiling or above `INT_MAX`, a non-ordered or over-budget attribute
+table, and a payload that is not legal UTF-8. None of those checks allocates,
+and a refusal poisons `XML_ERROR_MALFORMED_WIRE` before any handler runs; a
+failed payload or vector allocation reports `XML_ERROR_NO_MEMORY`.
+
+An element name and its ordered attribute pairs may arrive as ranges of the fed
+chunk together with the absolute offset of the chunk's first byte: the receiver
+checks every range against the owner, the bytes fed so far and the UTF-8 rules,
+then copies the whole event into one NUL-terminated arena plus one pointer
+vector, so an attribute-heavy tag costs two allocations instead of one per
+string. Character data is borrowed for that one callback and is never copied.
+An XML declaration value, a comment, a processing instruction or a tag whose
+name is not contiguous in the buffer arrives as an owned string and is copied
+into the same kind of capped, NUL-terminated arena. Payload storage is allocated
+only when the corresponding handler is installed; the allocation ledger observes
+zero shim allocations for a parse whose events have no handlers, and a positive
+count for the same events with handlers. The direct-linked test target exercises
+every control, including the allocation failure and the no-parser refusal.
+
+The earlier serialized event record is gone: there is no encoder or decoder for
+it in the shipped artifact, so its input is unreachable.
 
 ## What the evidence establishes, and what it does not
 
@@ -102,7 +122,7 @@ measurements and bounded libFuzzer campaigns over four targets:
 | target | instrumentation | establishes |
 | --- | --- | --- |
 | `parser` | generated Lean C plus Clang coverage/ASan/UBSan | one-shot parser faults and sanitizer termination over bounded inputs |
-| `cabi` | generated Lean C, `cabi/expat.c`, harness | C callback/frame and public ABI paths with candidate coverage |
+| `cabi` | generated Lean C, `cabi/expat.c`, harness | C callback and public ABI paths with candidate coverage |
 | `artifact` | harness only, shipped `.so` | loader and client smoke; **library coverage is absent** and sanitizer diagnostics do not cover library instructions |
 | `differential` | candidate and oracle each loaded with `dlopen` and called through separate `dlsym` tables; candidate is coverage + ASan/UBSan instrumented, oracle is the uninstrumented pinned library | normalized event/code agreement on generated supported-subset documents; any unlisted mismatch fails |
 
@@ -124,6 +144,13 @@ Limits of that evidence:
   because its sanitizer references resolve from the fuzzer executable's
   static runtime. That is a property of the instrumented test library, not of
   the shipped `liblexpat.so.1`, which keeps `--no-undefined`.
+* The shipped `liblexpat.so.1` carries `DF_1_NODELETE`. Initializing the Lean
+  runtime starts background threads whose entry points are inside the runtime
+  library, and the runtime has no shutdown that stops and joins them, so the
+  artifact and its runtime dependency stay mapped until the process exits:
+  `dlclose` releases the handle and performs no unload. The `artifact` loader
+  and client smoke therefore covers load, parse, free and close, and says
+  nothing about unloading, which this artifact does not support.
 * Coverage and campaign output live outside the repository; no crash, corpus
   mutation or binary is committed.
 * Scaling bounds apply only to the measured shapes, sizes and machine; a
@@ -153,7 +180,7 @@ bundles.
 
 ```sh
 nix develop -c bash tests/c-abi-oom-contract.sh A3
-nix develop -c python3 tests/c-abi-verify.py --wire
+nix develop -c python3 tests/c-abi-verify.py --bridge
 nix develop -c bash tests/security-oom-sanitized.sh --out /tmp/lexpat-oom
 nix develop -c python3 tests/security-cve.py
 nix develop -c bash tests/security-differential-fixed.sh --out /tmp/lexpat-diff

@@ -34,10 +34,12 @@ opener with the CDATA text and `cdataEnd` at `]]>`.
 
 Internally each event is a `LocatedEvent` carrying the token's raw byte offset,
 its span when known, its 1-based line and 0-based scalar column, and the number
-of explicit attribute pairs. The public `feed` and `finish` map those records
-back to the unchanged `Event` arrays. `feedSink` and `finishSink` offer each
-located event at its emission point to a caller-supplied sink, which is how the
-C bridge delivers callbacks before the feeding call returns.
+of explicit attribute pairs. A text token's payload is a borrowed span of the
+chunk being fed while that is possible and the token's own bytes once it is not,
+so a sink reads either form in place; the public `feed` and `finish` map those
+records back to the unchanged `Event` arrays. `feedSink` and `finishSink` offer
+each located event at its emission point to a caller-supplied sink, which is how
+the C bridge delivers callbacks before the feeding call returns.
 -/
 import LexPat.Types
 import LexPat.Lexer
@@ -169,16 +171,55 @@ structure Stream where
   an odd UTF-16 byte or high-surrogate unit). -/
   pending : ByteArray := ByteArray.empty
   pendingOffset : Nat := 0
-  /-- The unfinished lexical value: text, name, attribute value, comment,
-  CDATA, PI data or declaration value. -/
+  /-- The unfinished lexical value: name, attribute value, comment, CDATA, PI
+  data or declaration value. Character text has its own byte accumulator, so a
+  plain text run never pays one `Array Char` push per scalar. -/
   buf : Array Char := #[]
-  stack : Array String := #[]
+  /-- UTF-8 pieces of the unfinished text token, in order: one validated span per
+  chunk-local literal run, one expansion per reference and one encoding per
+  normalized line ending. Appending a piece copies that piece alone, so a token
+  that grows over many feeds costs linear copying instead of re-copying the whole
+  prefix; the pieces are joined once when the token is flushed. -/
+  textPieces : Array ByteArray := #[]
+  /-- Decoded characters in the unfinished text token, charged against
+  `maxTokenChars`. Byte length and character count differ for non-ASCII. -/
+  textChars : Nat := 0
+  /-- Span of the text token inside the chunk currently being fed, while the
+  token is still one contiguous literal run. Cleared (and its bytes taken as a
+  piece) by any append, any conversion, and at the end of the feed, so no state
+  ever holds a reference to a consumed chunk. A span exists only while the token
+  has no earlier piece. -/
+  textSpan : Option Span := none
+  /-- The open elements, innermost first. A name is owned because it must
+  outlive the chunk it was read from. The stack is pushed and popped at the
+  head, so nesting costs one cell per element instead of copying the whole
+  stack. -/
+  stack : List String := []
+  /-- The number of open elements, so the depth budget is checked without
+  walking `stack`. -/
+  depth : Nat := 0
   entityUsed : Nat := 0
   elemName : String := ""
   attrs : Array (String × String) := #[]
   attrName : String := ""
   markupOffset : Nat := 0
   markupIndex : Nat := 0
+  /-- The bytes of an unfinished start tag whose first byte is determined and
+  whose remainder has not arrived. They are held **unconsumed**: no budget is
+  charged and no position advances until the tag is committed, so its anchors
+  and limits are those of its first byte. Bounded by `tagCarryLimit`, never a
+  reference to a consumed chunk. -/
+  tagCarry : ByteArray := ByteArray.empty
+  /-- Bytes this carry has copied so far. A carried start tag appends the new
+  bytes and is rescanned, which keeps a tag that arrives in small chunks on the
+  scanner instead of the per-byte machine; this budget bounds the total copying
+  per tag, so a very long tag cannot make the append quadratic. -/
+  tagCarryCopied : Nat := 0
+  /-- Set once the start-tag scanner refused the current tag in the current
+  feed. Every condition that makes it refuse is still ahead in the remaining
+  bytes, so a retry from a later byte of the same feed would scan the same
+  remaining bytes and refuse again: at most one attempt is made per feed. -/
+  bulkTagTried : Bool := false
   spaced : Bool := false
   /-- A literal CR whose normalized character waits for an optional LF. -/
   pendingCR : Bool := false
@@ -302,6 +343,27 @@ private def atText (s : Stream) (event : Event) : LocatedEvent :=
     column := s.textColumn
     specifiedAttrs := 0 }
 
+/-- A text event whose payload is still a span of the chunk being fed. -/
+private def atTextWithSpan (s : Stream) (sp : Span) : LocatedEvent :=
+  { event := .text ""
+    byteOffset := s.textOffset
+    tokenBytes := none
+    line := s.textLine
+    column := s.textColumn
+    specifiedAttrs := 0
+    textSpan := some sp }
+
+/-- A text event whose payload is the token's own bytes, because no chunk span
+can name them any more. -/
+private def atTextBytes (s : Stream) (bytes : ByteArray) : LocatedEvent :=
+  { event := .text ""
+    byteOffset := s.textOffset
+    tokenBytes := none
+    line := s.textLine
+    column := s.textColumn
+    specifiedAttrs := 0
+    textBytes := some bytes }
+
 /-- The `cdataEnd` event, anchored at the `]]>` closing marker. -/
 private def atCdataClose (s : Stream) : LocatedEvent :=
   { event := .cdataEnd
@@ -317,7 +379,8 @@ private def noteTextStart (s : Stream) (offset line column : Nat) : Stream :=
                 textStarted := true }
 
 private def pushEvents (acc : Array LocatedEvent) (evs : Array LocatedEvent) : Array LocatedEvent :=
-  Id.run do
+  if evs.isEmpty then acc
+  else Id.run do
     let mut out := acc
     for e in evs do
       out := out.push e
@@ -326,19 +389,440 @@ private def pushEvents (acc : Array LocatedEvent) (evs : Array LocatedEvent) : A
 private def bufferString (buf : Array Char) : String :=
   String.ofList buf.toList
 
+/-- UTF-8 bytes of one scalar value. The decoder has already validated the
+scalar, so this is the canonical encoding of the same character the previous
+`Char` accumulator would have produced. -/
+private def scalarUtf8 (n : Nat) : ByteArray :=
+  if n < 0x80 then
+    ByteArray.mk #[UInt8.ofNat n]
+  else if n < 0x800 then
+    ByteArray.mk #[UInt8.ofNat (0xC0 + n / 0x40),
+                   UInt8.ofNat (0x80 + n % 0x40)]
+  else if n < 0x10000 then
+    ByteArray.mk #[UInt8.ofNat (0xE0 + n / 0x1000),
+                   UInt8.ofNat (0x80 + (n / 0x40) % 0x40),
+                   UInt8.ofNat (0x80 + n % 0x40)]
+  else
+    ByteArray.mk #[UInt8.ofNat (0xF0 + n / 0x40000),
+                   UInt8.ofNat (0x80 + (n / 0x1000) % 0x40),
+                   UInt8.ofNat (0x80 + (n / 0x40) % 0x40),
+                   UInt8.ofNat (0x80 + n % 0x40)]
+
+/-- Append one decoded character to the text token. The budget is charged in
+decoded characters, before the append. -/
+private def appendTextScalar (s : Stream) (n : Nat) (offset : Nat) :
+    Stream × Option ParseError :=
+  if s.textChars >= s.limits.maxTokenChars then
+    (s, some ⟨.limitToken, "limitToken", offset⟩)
+  else
+    ({ s with textPieces := s.textPieces.push (scalarUtf8 n),
+              textChars := s.textChars + 1 }, none)
+
+/-- Join the text token's pieces: one pass appending each piece in order to an
+accumulator. Core's compiled `ByteArray` append grows its destination
+asymptotically, so a token that arrived in `p` pieces costs one amortized pass
+over its bytes, while a pairwise tree would copy every byte at each of its
+`log p` levels and allocate an intermediate array per pair. Piece order is the
+order `textPieces` recorded, so the joined bytes are the token's bytes. -/
+private def joinTextPieces (pieces : Array ByteArray) : ByteArray :=
+  if pieces.size == 1 then pieces[0]!
+  else pieces.foldl (fun acc piece => acc ++ piece) ByteArray.empty
+
+/-- The validated constructor, used where the native unchecked entry point is
+not available: the interpreter that runs `tests/StreamingCases.lean` and
+`tests/ScannerDecoder.lean` evaluates this module directly and cannot resolve an
+`extern` symbol. The bytes are the same ones the native build passes through
+unchecked, so the two implementations agree by construction; only the
+validation pass differs. -/
+private def stringOfUtf8Validated (bytes : ByteArray) : String :=
+  String.fromUTF8! bytes
+
+/-- The runtime's unchecked UTF-8 constructor. Every piece the token collects is
+UTF-8 the decoder or the scalar encoder already validated -- a literal span, a
+converted scalar, a checked reference expansion -- and a piece boundary always
+falls between scalars, so a joined token is valid UTF-8. -/
+@[extern "lean_string_from_utf8_unchecked", implemented_by stringOfUtf8Validated]
+private opaque stringOfUtf8 (bytes : ByteArray) : String
+
+/-- Take a borrowed text span as the token's last piece. The span is bounded by
+the chunk that owns it, and the piece is bounded by the token budget that
+charged its bytes as they were scanned. A span only exists while the token has
+no earlier piece, so the span is the piece. -/
+private def materializeTextSpan (s : Stream) (owner : ByteArray) : Stream :=
+  match s.textSpan with
+  | none => s
+  | some sp =>
+    if sp.start <= sp.stop && sp.stop <= owner.size then
+      { s with textPieces := s.textPieces.push (owner.extract sp.start sp.stop),
+               textSpan := none }
+    else { s with textSpan := none }
+
+/-- The owned attribute pairs of a start event whose ranges are not contiguous
+in one buffer: the head of the element name came from an earlier feed or the
+encoding probe, so that event keeps the payload a sink copies from. -/
+private def materializeAttrs (chunk : ByteArray) (ranges : Array UInt64) :
+    Array (String × String) :=
+  Id.run do
+    let mut out : Array (String × String) := #[]
+    let mut k := 0
+    while k + 3 < ranges.size do
+      let anStart := (ranges[k]!).toNat
+      let anStop := (ranges[k + 1]!).toNat
+      let vStart := (ranges[k + 2]!).toNat
+      let vStop := (ranges[k + 3]!).toNat
+      out := out.push
+        (stringOfUtf8 (chunk.extract anStart anStop),
+         stringOfUtf8 (chunk.extract vStart vStop))
+      k := k + 4
+    return out
+
+/-- Resolve a text payload for a consumer that needs an owned string. -/
+private def materializeEvent (owner : ByteArray) (e : LocatedEvent) : LocatedEvent :=
+  match e.textBytes with
+  | some bytes =>
+    { e with event := .text (stringOfUtf8 bytes), textBytes := none }
+  | none =>
+    match e.textSpan with
+    | some sp =>
+      if sp.start <= sp.stop && sp.stop <= owner.size then
+        { e with event := .text (stringOfUtf8 (owner.extract sp.start sp.stop)),
+                 textSpan := none }
+      else { e with event := .text "", textSpan := none }
+    | none =>
+      -- A bulk start event keeps its attribute table as ranges; the public
+      -- `Event` array needs the pairs themselves.
+      match e.event, e.attrRanges with
+      | .start name #[], some ranges => { e with event := .start name (materializeAttrs owner ranges) }
+      | _, _ => e
+
+/-- An ASCII byte a name may contain after its first character. The scanner
+reads one byte per character, so it decides this from the byte itself: above
+`0x7F` every `NameChar` alternative is out of range, and below it the
+production reduces to these characters. -/
+@[inline] private def asciiNameChar (b : UInt8) : Bool :=
+  (b ≥ 0x61 && b ≤ 0x7A) || (b ≥ 0x41 && b ≤ 0x5A) || (b ≥ 0x30 && b ≤ 0x39) ||
+    b == 0x3A || b == 0x5F || b == 0x2D || b == 0x2E
+
+/-- An ASCII byte a name may start with, for the same reason. -/
+@[inline] private def asciiNameStart (b : UInt8) : Bool :=
+  (b ≥ 0x61 && b ≤ 0x7A) || (b ≥ 0x41 && b ≤ 0x5A) || b == 0x3A || b == 0x5F
+
+/-- An ASCII byte that an ordinary text run may consume in one span: it is an
+XML `Char`, it is not a markup, reference or CDATA bracket delimiter, and it is
+not a line ending that normalization has to rewrite. Bytes at or above `0x80`
+are excluded, so a multi-byte scalar keeps its one-scalar, one-column
+accounting through the decoder. -/
+private def isPlainTextByte (b : UInt8) : Bool :=
+  b.toNat >= 0x20 && b.toNat < 0x80 && b != 0x3C && b != 0x26 && b != 0x5D &&
+    b != 0x0D && b != 0x0A
+
+/-- The byte at `k`, or `0` past the end. A bulk scanner bounds its own loop by
+`chunk.size` before reading, and this is the unboxed form of `chunk[k]?`: the
+`Option` it would otherwise build is one allocation per byte scanned. -/
+@[inline] private def byteAt (chunk : ByteArray) (k : Nat) : UInt8 :=
+  if h : k < chunk.size then chunk[k]'h else 0
+
+/-- The index of the first byte at or after `k`, before `limit`, that is not an
+ASCII name character, or the first of `limit` and the end of the buffer. Tail
+recursive, so the scan allocates nothing. -/
+private def nameEnd (chunk : ByteArray) (limit : Nat) (k : Nat) : Nat :=
+  if h : k < chunk.size then
+    if k < limit && asciiNameChar (chunk[k]'h) then nameEnd chunk limit (k + 1) else k
+  else k
+termination_by chunk.size - k
+
+/-- The bytes at `a0 + k` and `b0 + k` agree for all `k < n`. -/
+private def rangeEqFrom (chunk : ByteArray) (a0 b0 n k : Nat) : Bool :=
+  if k < n then
+    if byteAt chunk (a0 + k) == byteAt chunk (b0 + k) then rangeEqFrom chunk a0 b0 n (k + 1)
+    else false
+  else true
+termination_by n - k
+
+/-- Two byte ranges of `chunk` hold the same bytes. -/
+private def rangeEq (chunk : ByteArray) (a0 a1 b0 b1 : Nat) : Bool :=
+  if a1 - a0 != b1 - b0 then false
+  else rangeEqFrom chunk a0 b0 (a1 - a0) 0
+
+/-- The order of `a` and `b` read from `chunk`, compared from byte `k`: a range
+that is a prefix of the other sorts first. -/
+private def rangeCompareFrom (chunk : ByteArray) (a b : Span) (k : Nat) : Ordering :=
+  if h : k < a.stop - a.start then
+    if k < b.stop - b.start then
+      let x := byteAt chunk (a.start + k)
+      let y := byteAt chunk (b.start + k)
+      if x < y then .lt else if x > y then .gt else rangeCompareFrom chunk a b (k + 1)
+    else .gt
+  else if k < b.stop - b.start then .lt
+  else .eq
+termination_by (a.stop - a.start) - k
+
+/-- The order of two byte ranges of `chunk`. -/
+private def rangeCompare (chunk : ByteArray) (a b : Span) : Ordering :=
+  rangeCompareFrom chunk a b 0
+
+/-- Two attribute names in one tag are the same name. The scan compares the
+scanned bytes in place, so a tag does not pay an owned string per attribute
+before the table is known to be free of duplicates. -/
+private def hasDuplicateNames (chunk : ByteArray) (names : Array Span) : Bool :=
+  if names.size < 2 then false
+  else
+    let ordered := names.qsort (fun a b => rangeCompare chunk a b == .lt)
+    Id.run do
+      let mut found := false
+      let mut k := 1
+      while k < ordered.size && !found do
+        match ordered[k - 1]?, ordered[k]? with
+        | some a, some b =>
+          if rangeEq chunk a.start a.stop b.start b.stop then found := true
+        | _, _ => pure ()
+        k := k + 1
+      return found
+
+/-- The index of the first byte at or after `k` that is not `b`, or
+`chunk.size`. -/
+private def findByte (chunk : ByteArray) (b : UInt8) (k : Nat) : Nat :=
+  if h : k < chunk.size then
+    if (chunk[k]'h) == b then k else findByte chunk b (k + 1)
+  else k
+termination_by chunk.size - k
+
+/-- The index of the first byte at or after `k` that is not a space. -/
+private def spaceEnd (chunk : ByteArray) (k : Nat) : Nat :=
+  if h : k < chunk.size then
+    if (chunk[k]'h) == 0x20 then spaceEnd chunk (k + 1) else k
+  else k
+termination_by chunk.size - k
+
+/-- The index of the first byte at or after `k` that ends an attribute value
+quoted with `q`: the closing quote, a character the bulk scanner will not
+accept inside a value, or the end of the buffer. -/
+private def attrValueEnd (chunk : ByteArray) (q : UInt8) (k : Nat) : Nat :=
+  if h : k < chunk.size then
+    let d := chunk[k]'h
+    if d != q && d != 0x3C && d != 0x26 && d.toNat >= 0x20 && d.toNat < 0x80 then
+      attrValueEnd chunk q (k + 1)
+    else k
+  else k
+termination_by chunk.size - k
+
+/-- The index of the first byte at or after `k` that a plain text run may not
+consume, or `chunk.size`. `limit` is the last byte index the run may reach. -/
+private def plainTextEnd (chunk : ByteArray) (limit : Nat) (k : Nat) : Nat :=
+  if h : k < chunk.size then
+    if k < limit && isPlainTextByte (chunk[k]'h) then plainTextEnd chunk limit (k + 1)
+    else k
+  else k
+termination_by chunk.size - k
+
+/-- The outcome of scanning for the terminator of a comment, CDATA section or
+processing instruction. -/
+private inductive TermEnd where
+  /-- The terminator begins here. -/
+  | at (k : Nat)
+  /-- A byte the construct may not contain, which the per-byte machine reports
+  with its own reason and offset. -/
+  | illegal
+  /-- The terminator is not in these bytes. -/
+  | missing
+
+/-- The `-->` terminator of a comment, scanning from `k`. A `-` that does not
+open the terminator ends the scanner's authority over the token. -/
+private def commentEnd (chunk : ByteArray) (k : Nat) : TermEnd :=
+  if k + 2 < chunk.size then
+    if byteAt chunk k == 0x2D && byteAt chunk (k + 1) == 0x2D &&
+        byteAt chunk (k + 2) == 0x3E then
+      .at k
+    else
+      let d := byteAt chunk k
+      if d == 0x2D || d.toNat < 0x20 || d.toNat >= 0x80 then .illegal
+      else commentEnd chunk (k + 1)
+  else .missing
+termination_by chunk.size - k
+
+/-- The `]]>` terminator of a CDATA section, scanning from `k`. A `]` that does
+not open the terminator ends the scanner's authority over the token. -/
+private def cdataEnd (chunk : ByteArray) (k : Nat) : TermEnd :=
+  if k + 2 < chunk.size then
+    if byteAt chunk k == 0x5D && byteAt chunk (k + 1) == 0x5D &&
+        byteAt chunk (k + 2) == 0x3E then
+      .at k
+    else
+      let d := byteAt chunk k
+      if d == 0x5D || d.toNat < 0x20 || d.toNat >= 0x80 then .illegal
+      else cdataEnd chunk (k + 1)
+  else .missing
+termination_by chunk.size - k
+
+/-- The `?>` terminator of processing-instruction data, scanning from `k`. A
+`?` that does not open the terminator ends the scanner's authority. -/
+private def piDataEnd (chunk : ByteArray) (k : Nat) : TermEnd :=
+  if k + 1 < chunk.size then
+    if byteAt chunk k == 0x3F && byteAt chunk (k + 1) == 0x3E then
+      .at k
+    else
+      let d := byteAt chunk k
+      if d == 0x3F || d.toNat < 0x20 || d.toNat >= 0x80 then .illegal
+      else piDataEnd chunk (k + 1)
+  else .missing
+termination_by chunk.size - k
+
+/-- The `<` a scanner checks for when its buffer may hold that byte: an earlier
+step already checked it when `lead` is `0`, and `i` is the index of the token's
+first byte after it. -/
+private def leadLt (chunk : ByteArray) (lead i : Nat) : Bool :=
+  lead == 0 || byteAt chunk (i - 1) == 0x3C
+
+/-- The absolute byte offset of the `<` a bulk token opens at: the stream's own
+cursor when the buffer begins at that byte, and the recorded markup anchor when
+an earlier step consumed it. The anchor is the recorded one for the second case
+because a replayed prefix charges its bytes once but is scanned again from the
+buffer, so the cursor and the replayed bytes do not coincide while they are
+scanned. -/
+private def tokenOffset (s : Stream) (lead : Nat) : Nat :=
+  if lead == 1 then s.rawConsumed else s.markupOffset
+
+/-- The 1-based line of the `<` a bulk token opens at. -/
+private def tokenLine (s : Stream) (lead : Nat) : Nat :=
+  if lead == 1 then s.line else s.markupLine
+
+/-- The 0-based scalar column of the `<` a bulk token opens at. -/
+private def tokenColumn (s : Stream) (lead : Nat) : Nat :=
+  if lead == 1 then s.column else s.markupColumn
+
+/-- The scalar index of the `<` a bulk token opens at. -/
+private def tokenIndex (s : Stream) (lead : Nat) : Nat :=
+  if lead == 1 then s.charIndex else s.markupIndex
+
+/-- The stream a committed bulk token continues as: the cursor moves past the
+token, the markup fields record the `<` it opened at, and the lexical state the
+caller names replaces the token's. Every field is written in this one
+construction, so a committed token costs one state update rather than one per
+field group. -/
+private def tokenContinuation (s : Stream) (lead consumed : Nat)
+    (phase : Phase) (mode : Mode) (stack : List String) (depth : Nat)
+    (elemName : String) (attrs : Array (String × String)) (buf : Array Char)
+    (spaced textStarted : Bool) : Stream :=
+  { s with
+    rawConsumed := s.rawConsumed + consumed + lead,
+    column := s.column + consumed + lead,
+    charIndex := s.charIndex + consumed + lead,
+    prevRawCR := false,
+    markupOffset := tokenOffset s lead,
+    markupLine := tokenLine s lead,
+    markupColumn := tokenColumn s lead,
+    markupIndex := tokenIndex s lead,
+    charLine := tokenLine s lead,
+    charColumn := tokenColumn s lead,
+    phase := phase, mode := mode, stack := stack, depth := depth,
+    elemName := elemName, attrs := attrs, buf := buf, spaced := spaced,
+    textStarted := textStarted }
+
+/-- A located event anchored at the `<` a bulk token opened at. `lead` and
+`consumed` are as for the scanners below; `tokenBytes` counts the `<` too. -/
+private def atToken (s : Stream) (lead consumed : Nat) (event : Event)
+    (pairs : Nat := 0) (base : Nat := 0) : LocatedEvent :=
+  { event := event
+    byteOffset := tokenOffset s lead
+    tokenBytes := some (consumed + 1)
+    line := tokenLine s lead
+    column := tokenColumn s lead
+    specifiedAttrs := pairs
+    sliceBase := base }
+
+/-- A text run may be consumed in one span only when the decoder holds no
+unfinished scalar, the grammar is inside a text token and no deferred CR is
+waiting for its LF. Each encoding then applies its own byte or code-unit rule.
+
+`contentStart` is eligible too: the per-byte machine reprocesses the first
+character of such a run in the text mode it introduces, so a completed run
+leaves the stream in `text` exactly as that path does. -/
+private def fastTextEligible (s : Stream) : Bool :=
+  s.pending.isEmpty && !s.pendingCR &&
+    (match s.mode with | .text => true | .contentStart => true | _ => false)
+
+/-- One bulk text run over the current chunk.
+
+`len` is the number of input bytes consumed, `chars` the number of decoded
+characters they produce, and `converted` the UTF-8 bytes when the encoding is
+not already UTF-8. `none` means the input span itself is the UTF-8 payload, so
+the caller can append the chunk slice without an intermediate copy.
+
+The scan stops at every byte or code unit whose handling is not a plain
+literal: markup, reference and CDATA delimiters, line endings, non-ASCII UTF-8
+bytes, UTF-16 surrogates or non-ASCII code units, and Latin-1/ASCII control
+bytes that the grammar has to reject. It never consumes past the input budget,
+so the caller's budget fault keeps its exact offset. -/
+private structure TextRun where
+  len : Nat := 0
+  chars : Nat := 0
+  converted : Option ByteArray := none
+
+private def scanTextRun (s : Stream) (chunk : ByteArray) (i : Nat) : TextRun :=
+  if !fastTextEligible s then {}
+  else
+    let room := s.limits.maxInputBytes - s.rawConsumed
+    match s.enc with
+    | .decided .utf8 | .decided .ascii =>
+      let stop := plainTextEnd chunk (i + room) i
+      { len := stop - i, chars := stop - i }
+    | .decided .latin1 =>
+      Id.run do
+        let mut k := i
+        let mut out := ByteArray.empty
+        while k < chunk.size && k - i < room &&
+            (match chunk[k]? with
+             | some b => b.toNat >= 0x20 && b != 0x3C && b != 0x26 && b != 0x5D &&
+                 b != 0x0D && b != 0x0A
+             | none => false) do
+          let b := chunk[k]!
+          out := if b.toNat < 0x80 then out.push b
+                 else
+                   out.push (UInt8.ofNat (0xC0 + b.toNat / 0x40))
+                     |>.push (UInt8.ofNat (0x80 + b.toNat % 0x40))
+          k := k + 1
+        return { len := k - i, chars := k - i, converted := some out }
+    | .decided .utf16le => scanTextUtf16 chunk i room false
+    | .decided .utf16be => scanTextUtf16 chunk i room true
+    | _ => {}
+where
+  scanTextUtf16 (chunk : ByteArray) (i room : Nat) (bigEndian : Bool) : TextRun :=
+    Id.run do
+      let mut k := i
+      let mut out := ByteArray.empty
+      let mut stop := false
+      while !stop && k < chunk.size && k - i + 2 <= room do
+        match chunk[k]?, chunk[k + 1]? with
+        | some b0, some b1 =>
+          let u := utf16Unit bigEndian b0 b1
+          if u < 0x20 || u >= 0x80 || u == 0x3C || u == 0x26 || u == 0x5D then
+            stop := true
+          else
+            out := out.push (UInt8.ofNat u)
+            k := k + 2
+        | _, _ => stop := true
+      return { len := k - i, chars := (k - i) / 2, converted := some out }
+
 private def appendChar (s : Stream) (ch : Char) (offset : Nat) :
     Stream × Option ParseError :=
   if s.buf.size ≥ s.limits.maxTokenChars then
     (s, some ⟨.limitToken, "limitToken", offset⟩)
   else
-    ({ s with buf := s.buf.push ch }, none)
+    -- Take the buffer out of the record before appending, so the append reuses
+    -- the array in place: a token built one character at a time must stay linear
+    -- in its length, or the token budget itself becomes a quadratic work factor.
+    let buf := s.buf
+    let cleared := { s with buf := #[] }
+    ({ cleared with buf := buf.push ch }, none)
 
 private def appendRefChar (s : Stream) (ch : Char) (offset : Nat) :
     Stream × Option ParseError :=
   if s.refBuf.size ≥ s.limits.maxTokenChars then
     (s, some ⟨.limitToken, "limitToken", offset⟩)
   else
-    ({ s with refBuf := s.refBuf.push ch }, none)
+    let buf := s.refBuf
+    let cleared := { s with refBuf := #[] }
+    ({ cleared with refBuf := buf.push ch }, none)
 
 /-- Charge one numeric-character-reference digit against the token budget.
 Digits are parsed into a number rather than stored in `refBuf`, so their run
@@ -350,12 +834,68 @@ private def chargeRefDigit (s : Stream) (digits : Nat) (offset : Nat) :
     some ⟨.limitToken, "limitToken", offset⟩
   else none
 
-private def flushText (s : Stream) (evs : Array LocatedEvent) : Stream × Array LocatedEvent :=
-  if s.buf.isEmpty then
-    ({ s with textStarted := false }, evs)
+/-- The events one committed bulk step determined, in document order. A step
+determines at most four -- the text a `<` flushes, plus a CDATA section's opener,
+its content and its close -- so the delivery path needs no intermediate array. -/
+private inductive StepEvents where
+  | none
+  | one (a : LocatedEvent)
+  | two (a b : LocatedEvent)
+  | three (a b c : LocatedEvent)
+  | four (a b c d : LocatedEvent)
+
+/-- The events of the text flush a bulk step performs. `flushText` determines at
+most one event, so anything else is a shape this bridge does not carry. -/
+private def stepEventsOfFlush (evs : Array LocatedEvent) : StepEvents :=
+  match evs[0]? with
+  | some e => .one e
+  | none => .none
+
+/-- The events of `first` followed by the events of `second`: a `<` flushes the
+text token that ends at it before the construct it opens begins. `first` is a
+flush, which determines at most one event, so the final case is unreachable. -/
+private def stepThen : StepEvents → StepEvents → StepEvents
+  | .none, b => b
+  | a, .none => a
+  | .one a, .one b => .two a b
+  | .one a, .two b c => .three a b c
+  | .one a, .three b c d => .four a b c d
+  | _, b => b
+
+/-- The text flush's event, if any, without the one-element array the array form
+would build: a bulk step delivers its events in order. -/
+private def flushTextStep (s : Stream) : Stream × StepEvents :=
+  if s.textPieces.isEmpty then
+    match s.textSpan with
+    | none =>
+      -- No token to flush. Copying the stream is what a flush costs a caller
+      -- that reaches this branch once per markup token, so a stream that never
+      -- started a token is returned as it is.
+      (if s.textStarted then { s with textStarted := false } else s, .none)
+    | some sp =>
+      -- The flushed token ends here, so its character count goes with it: the
+      -- budget is per token, and the next token starts from zero however its
+      -- bytes were held.
+      ({ s with textStarted := false, textSpan := none, textChars := 0 },
+       .one (atTextWithSpan s sp))
   else
-    let text := bufferString s.buf
-    ({ s with buf := #[], textStarted := false }, evs.push (atText s (.text text)))
+    -- The token's bytes are already a byte array, and every consumer that
+    -- cannot borrow a chunk span can read a length-delimited buffer, so the
+    -- flush delivers them as they are. Only the public `Event` API, which
+    -- returns `String` payloads, builds a `String` from them.
+    let bytes := joinTextPieces s.textPieces
+    ({ s with
+       textPieces := #[], textChars := 0, textStarted := false, textSpan := none },
+     .one (atTextBytes s bytes))
+
+/-- The text flush's event appended to an accumulator, for the per-byte
+machine, which keeps an event array. -/
+private def flushText (s : Stream) (evs : Array LocatedEvent) : Stream × Array LocatedEvent :=
+  let (s', step) := flushTextStep s
+  match step with
+  | .none => (s', evs)
+  | .one e => (s', evs.push e)
+  | _ => (s', evs)
 
 /-- The mode that resumes the current phase after a comment, PI or similar
 construct. -/
@@ -378,22 +918,28 @@ private def detectedEncoding (s : Stream) : Encoding :=
 
 /-! ## Start and end tags -/
 
+/-- Two attribute names that compare equal after ordering. A pair of names is
+the shortest case a duplicate can occupy, so smaller tables skip the sort. -/
+private def hasDuplicateAttr (attrs : Array (String × String)) : Bool :=
+  if attrs.size < 2 then false
+  else
+    let ordered := attrs.qsort (fun a b => a.1 < b.1)
+    Id.run do
+      let mut found := false
+      let mut k := 1
+      while k < ordered.size do
+        match ordered[k]?, ordered[k - 1]? with
+        | some a, some b => if a.1 == b.1 then found := true
+        | _, _ => pure ()
+        k := k + 1
+      return found
+
 private def completeStartTag (s : Stream) (empty : Bool) : Stream × Array LocatedEvent :=
-  let ordered := s.attrs.qsort (fun a b => a.1 < b.1)
-  let duplicate := Id.run do
-    let mut found := false
-    let mut k := 1
-    while k < ordered.size do
-      match ordered[k]?, ordered[k - 1]? with
-      | some a, some b => if a.1 == b.1 then found := true
-      | _, _ => pure ()
-      k := k + 1
-    return found
-  if duplicate then
+  if hasDuplicateAttr s.attrs then
     -- A duplicate attribute is a fault of the whole start tag: report the
     -- opening `<` so the byte index and the line and column name one token.
     (failAtMarkup s .duplicateAttribute "duplicateAttribute", #[])
-  else if !empty && s.stack.size ≥ s.limits.maxDepth then
+  else if !empty && s.depth ≥ s.limits.maxDepth then
     (failAtMarkup s .limitDepth "limitDepth", #[])
   else
     let name := s.elemName
@@ -402,23 +948,26 @@ private def completeStartTag (s : Stream) (empty : Bool) : Stream × Array Locat
     if empty then
       let evs := started.push (atMarkup s (.end name))
       let phase := if s.phase == .prolog then Phase.epilog else s.phase
-      ({ s with phase := phase, mode := resumeMode phase, stack := s.stack,
+      ({ s with phase := phase, mode := resumeMode phase,
                 elemName := "", attrs := #[], buf := #[], spaced := false }, evs)
     else
       ({ s with phase := .content, mode := .contentStart,
-                stack := s.stack.push name,
+                stack := name :: s.stack, depth := s.depth + 1,
                 elemName := "", attrs := #[], buf := #[], spaced := false }, started)
 
 private def finishEndTag (s : Stream) (name : String) : Stream × Array LocatedEvent :=
-  match s.stack.back? with
+  match s.stack.head? with
   | some top =>
     if top == name then
-      let stack := s.stack.pop
+      let stack := s.stack.tail
       let evs : Array LocatedEvent := #[atMarkup s (.end name)]
       if stack.isEmpty then
-        ({ s with stack := stack, phase := .epilog, mode := .epilogStart }, evs)
+        ({ s with
+          stack := stack, depth := s.depth - 1,
+          phase := .epilog, mode := .epilogStart }, evs)
       else
-        ({ s with stack := stack, mode := .contentStart }, evs)
+        ({ s with
+          stack := stack, depth := s.depth - 1, mode := .contentStart }, evs)
     else
       (failAtMarkup s .tagMismatch "tagMismatch", #[])
   | none => (failAtMarkup s .invalidToken "strayEndTag", #[])
@@ -530,7 +1079,7 @@ private def finishReference (s : Stream) (sc : Scalar) : Stream × Array Located
     let s1 := { s with entityUsed := s.entityUsed + 1 }
     match s.refCtx with
     | .text =>
-      match appendChar s1 sc.toChar s.refStartOffset with
+      match appendTextScalar s1 sc.n s.refStartOffset with
       | (s2, some e) => (failedWith s2 e, #[])
       | (s2, none) => ({ s2 with mode := .text }, #[])
     | .attribute quote =>
@@ -716,7 +1265,11 @@ private def runStep : Nat → Stream → DecodedChar → Stream × Array Located
       let mapped : Char := match s.mode with
         | .attrValue _ => ' '
         | _ => '\n'
-      match appendChar s mapped c.byteOffset with
+      let appended : Stream × Option ParseError :=
+        match s.mode with
+        | .text => appendTextScalar s mapped.toNat c.byteOffset
+        | _ => appendChar s mapped c.byteOffset
+      match appended with
       | (s1, some e) => (failedWith s1 e, #[])
       | (s1, none) =>
         let s2 := { s1 with pendingCR := false }
@@ -765,29 +1318,29 @@ private def runStep : Nat → Stream → DecodedChar → Stream × Array Located
           ({ noteTextStart s c.byteOffset s.charLine s.charColumn with
                     pendingCR := true }, #[])
         else if isXmlChar c.value.n then
-          match appendChar (noteTextStart s c.byteOffset s.charLine s.charColumn)
-              c.value.toChar c.byteOffset with
+          match appendTextScalar (noteTextStart s c.byteOffset s.charLine s.charColumn)
+              c.value.n c.byteOffset with
           | (s1, some e) => (failedWith s1 e, #[])
           | (s1, none) => (s1, #[])
         else (failCode s .invalidToken "illegalXmlChar" c.byteOffset, #[])
       | .textBracket1 =>
         if c.value.n == 0x5D then ({ s with mode := .textBracket2 }, #[])
         else
-          match appendChar s ']' c.byteOffset with
+          match appendTextScalar s 0x5D c.byteOffset with
           | (s1, some e) => (failedWith s1 e, #[])
           | (s1, none) => reprocess ({ s1 with mode := .text })
       | .textBracket2 =>
         if c.value.n == 0x3E then
           (failCode s .invalidToken "cdataEndInText" c.byteOffset, #[])
         else if c.value.n == 0x5D then
-          match appendChar s ']' c.byteOffset with
+          match appendTextScalar s 0x5D c.byteOffset with
           | (s1, some e) => (failedWith s1 e, #[])
           | (s1, none) => ({ s1 with mode := .textBracket2 }, #[])
         else
-          match appendChar s ']' c.byteOffset with
+          match appendTextScalar s 0x5D c.byteOffset with
           | (s1, some e) => (failedWith s1 e, #[])
           | (s1, none) =>
-            match appendChar s1 ']' c.byteOffset with
+            match appendTextScalar s1 0x5D c.byteOffset with
             | (s2, some e) => (failedWith s2 e, #[])
             | (s2, none) => reprocess ({ s2 with mode := .text })
       | .markup =>
@@ -828,7 +1381,9 @@ private def runStep : Nat → Stream → DecodedChar → Stream × Array Located
         | some expected =>
           if c.value.n == expected then
             if matched + 1 == 7 then
-              ({ s with mode := .cdata, buf := #[], textStarted := false },
+              ({ s with
+                  mode := .cdata, buf := #[], textPieces := #[],
+                  textChars := 0, textStarted := false },
                #[atMarkup s .cdataStart])
             else ({ s with mode := .bangCdata (matched + 1) }, #[])
           else (failedWith s (unknownMarkupError s), #[])
@@ -976,8 +1531,14 @@ private def runStep : Nat → Stream → DecodedChar → Stream × Array Located
       | .attrValue quote =>
         if c.value.n == quote.toNat then
           let value := bufferString s.buf
-          ({ s with attrs := s.attrs.push (s.attrName, value), buf := #[],
-                    mode := .startAfterName, spaced := false, attrName := "" }, #[])
+          -- Take the pair array out of the record before appending, so the append
+          -- reuses it in place: a tag whose attributes arrive one at a time must
+          -- stay linear in their number instead of copying the array per pair.
+          let attrs := s.attrs
+          let next := { s with
+            attrs := #[], buf := #[], mode := .startAfterName,
+            spaced := false, attrName := "" }
+          ({ next with attrs := attrs.push (s.attrName, value) }, #[])
         else if c.value.n == 0x26 then
           ({ s with mode := .refAfterAmp, refCtx := RefCtx.attribute quote,
                     refStartOffset := c.byteOffset, refBuf := #[] }, #[])
@@ -1128,21 +1689,19 @@ private def runStep : Nat → Stream → DecodedChar → Stream × Array Located
 
 /-- Advance the 1-based line and 0-based scalar column past one decoded scalar.
 A CR starts a new line; an LF starts one only when it does not complete a
-CRLF pair. -/
-private def advanceLoc (line column : Nat) (prevCR : Bool) (n : Nat) :
-    Nat × Nat × Bool :=
-  if n == 0x0A then
-    if prevCR then (line, 0, false) else (line + 1, 0, false)
-  else if n == 0x0D then (line + 1, 0, true)
-  else (line, column + 1, false)
-
+CRLF pair. Written as separate scalar computations so the per-scalar step does
+not allocate a tuple for the three results. -/
 private def stepChar (s : Stream) (c : DecodedChar) : Stream × Array LocatedEvent :=
   let line := s.line
   let column := s.column
-  let (line', column', prevCR') := advanceLoc line column s.prevRawCR c.value.n
+  let n := c.value.n
+  let isCR := n == 0x0D
+  let isLF := n == 0x0A
+  let line' := if isCR || (isLF && !s.prevRawCR) then line + 1 else line
+  let column' := if isCR || isLF then 0 else column + 1
   let s0 := { s with charIndex := s.charIndex + 1,
                      charLine := line, charColumn := column,
-                     line := line', column := column', prevRawCR := prevCR' }
+                     line := line', column := column', prevRawCR := isCR }
   let (s1, evs) := runStep 8 s0 c
   let s2 :=
     match s1.status with
@@ -1248,23 +1807,737 @@ private def decodeByte (s : Stream) (b : UInt8) (off : Nat) : ByteOutcome :=
         .failed (failHere s .invalidToken "invalidAscii" off) #[]
   | _ => .failed (failHere s .syntax "decoderNotReady" off) #[]
 
+/-! ## Bulk markup scanning
+
+A markup construct whose bytes are entirely inside the current chunk, ASCII and
+free of references is scanned once by byte index and committed with a single
+state update. Each scanner returns `none` for anything it does not fully
+understand -- a cross-chunk tag, a non-ASCII name, a reference in a value, a
+malformed or duplicate attribute, an over-budget token, a depth or stack fault,
+a reserved processing-instruction target or an anomalous delimiter. `none`
+replays the same bytes through the per-byte machine from the unchanged state,
+so every fault keeps its exact code, reason, byte offset and line and column.
+
+The `<` that opens a construct is scanned with the construct itself: the text
+token that ends at it is flushed and the tag, comment, CDATA section or
+processing instruction is committed from the same buffer in one step, so the
+position and mode a separate `<` step would record are computed in the same
+state update that the construct commits. A scanner is told whether its buffer
+begins at the `<` (`lead` is `1`) or after it (`lead` is `0`, an earlier step
+already consumed and charged it), which is what lets the folded path and the
+resumed path share one scanner.
+-/
+
+/-- A located event anchored at the opening `<` of the current markup token, for
+a commit that already knows how many bytes the token consumed. `atMarkup` needs
+an already-advanced stream; this one takes the count, so the commit can build its
+continuation in a single state update. -/
+private def atMarkupConsumed (s : Stream) (event : Event) (pairs consumed base : Nat) :
+    LocatedEvent :=
+  { event := event
+    byteOffset := s.markupOffset
+    tokenBytes := some (s.rawConsumed + consumed - s.markupOffset)
+    line := s.markupLine
+    column := s.markupColumn
+    specifiedAttrs := pairs
+    sliceBase := base }
+
+/-- One committed bulk token: the continuation, its events and the next byte. -/
+private abbrev Bulk := Option (Stream × StepEvents × Nat)
+
+/-- The outcome of scanning a start tag. `done` commits it, `more` means the
+bytes so far are a well-formed tag prefix whose remaining bytes are not in the
+buffer, and `refuse` means this scanner cannot commit the tag at all. -/
+private inductive TagScan where
+  | done (s : Stream) (evs : StepEvents) (next : Nat)
+  | fail (s : Stream)
+  | more
+  | refuse
+
+/-- The most bytes of an unfinished start tag the stream holds between feeds.
+Beyond it the per-byte machine takes over, so a tag that is long in bytes keeps
+its linear cost instead of being rescanned as it grows. -/
+private def tagCarryLimit : Nat := 64 * 1024
+
+/-- The stream a bulk scanner returns when the token it just measured cannot fit
+the token budget. `offset` is the absolute byte of the first character past the
+budget -- the character the per-byte machine would refuse -- and `column` is its
+comma-free column, which is the current column plus that character's distance in
+the scanned buffer: a bulk-scannable tag has no line break in it. -/
+private def bulkTokenFault (s : Stream) (offset column : Nat) : Stream :=
+  { failCode s .limitToken "limitToken" offset with
+    failLine := s.line, failColumn := column, failSet := true }
+
+/-- Scan a start tag whose element name begins at `i`. `lead` is `1` when the
+buffer also holds the `<` immediately before that name, and `0` when an earlier
+step already consumed and charged that byte; `base` is the absolute offset of the
+buffer's first byte. `namePrefix` carries the part of the element name that an
+earlier feed or the encoding probe already consumed, so a tag can still be
+committed whole after it crossed a boundary or the buffered prefix.
+
+Whitespace inside the tag is a space only, and a value byte must be printable
+ASCII, so a committed tag contains no line break: the bulk commit advances the
+column by the bytes it consumed. Anything else -- a reference in a value, a
+non-ASCII name, a malformed or duplicate attribute, an over-budget token, a
+depth or stack fault, or an anomalous delimiter -- is `refuse`, and the same
+bytes replay through the per-byte machine so every fault keeps its exact code,
+reason, byte offset and line and column.
+
+The attribute table is returned as ranges of the scanned buffer, not as owned
+strings: a consumer that copies into its own storage reads the ranges once, and
+only a consumer that materializes the public `Event` array builds the strings. -/
+private def scanStartTag (s : Stream) (chunk : ByteArray) (i : Nat)
+    (namePrefix : String) (havePrefix : Bool) (lead base : Nat) : TagScan :=
+  Id.run do
+    let n := chunk.size
+    if !havePrefix && !asciiNameStart (byteAt chunk i) then return .refuse
+    let nameStart := i
+    -- Stop as soon as the name cannot fit the token budget: the per-byte
+    -- machine then charges and refuses that exact character, so the scan of a
+    -- rejected long name is bounded by the budget instead of its length.
+    let nameStop :=
+      nameEnd chunk (nameStart + (s.limits.maxTokenChars - namePrefix.length) + 1) i
+    if nameStop ≥ n then return .more
+    if namePrefix.length + (nameStop - nameStart) > s.limits.maxTokenChars then
+      -- The name is already longer than any token may be, and every byte before
+      -- the budget's edge was a valid name character: the first character past
+      -- the budget is the certain fault, exactly as the per-byte machine reports
+      -- it, without accumulating or rescanning the rejected name.
+      return .fail
+        (bulkTokenFault s
+          (s.rawConsumed + lead + (s.limits.maxTokenChars - namePrefix.length))
+          (s.column + lead + (nameStart - i + (s.limits.maxTokenChars - namePrefix.length))))
+    let mut names : Array Span := #[]
+    let mut ranges : Array UInt64 := #[]
+    let mut k := nameStop
+    let mut empty := false
+    let mut done := false
+    while !done do
+      if k ≥ n then return .more
+      else
+      let b := byteAt chunk k
+      if b == 0x3E then
+        done := true
+        k := k + 1
+      else if b == 0x2F then
+        if k + 1 ≥ n then return .more
+        if byteAt chunk (k + 1) != 0x3E then return .refuse
+        empty := true
+        done := true
+        k := k + 2
+      else if b == 0x20 then
+        k := spaceEnd chunk k
+        if k ≥ n then return .more
+        let c := byteAt chunk k
+        if c == 0x3E then
+          done := true
+          k := k + 1
+        else if c == 0x2F then
+          if k + 1 ≥ n then return .more
+          if byteAt chunk (k + 1) != 0x3E then return .refuse
+          empty := true
+          done := true
+          k := k + 2
+        else if asciiNameStart c then
+          let anStart := k
+          let anStop := nameEnd chunk n k
+          if anStop ≥ n then return .more
+          if anStop - anStart > s.limits.maxTokenChars then
+            return .fail
+              (bulkTokenFault s
+                (s.rawConsumed + lead + (anStart - i + s.limits.maxTokenChars))
+                (s.column + lead + (anStart - i + s.limits.maxTokenChars)))
+          let eqAt := spaceEnd chunk anStop
+          if eqAt ≥ n then return .more
+          if byteAt chunk eqAt != 0x3D then return .refuse
+          let quoteAt := spaceEnd chunk (eqAt + 1)
+          if quoteAt ≥ n then return .more
+          let q := byteAt chunk quoteAt
+          if q != 0x22 && q != 0x27 then return .refuse
+          let vStart := quoteAt + 1
+          let vStop := attrValueEnd chunk q vStart
+          if vStop ≥ n then return .more
+          if byteAt chunk vStop != q then return .refuse
+          if vStop - vStart > s.limits.maxTokenChars then
+            return .fail
+              (bulkTokenFault s
+                (s.rawConsumed + lead + (vStart - i + s.limits.maxTokenChars))
+                (s.column + lead + (vStart - i + s.limits.maxTokenChars)))
+          ranges := ranges.push (UInt64.ofNat anStart) |>.push (UInt64.ofNat anStop)
+            |>.push (UInt64.ofNat vStart) |>.push (UInt64.ofNat vStop)
+          names := names.push ⟨anStart, anStop⟩
+          k := vStop + 1
+        else return .refuse
+      else return .refuse
+    if hasDuplicateNames chunk names then return .refuse
+    if !empty && s.depth ≥ s.limits.maxDepth then return .refuse
+    let scanned := stringOfUtf8 (chunk.extract nameStart nameStop)
+    let name := if havePrefix then namePrefix ++ scanned else scanned
+    let consumed := k - i
+    if consumed > s.limits.maxInputBytes - (s.rawConsumed + lead) then return .refuse
+    let pairs := ranges.size / 4
+    let anchored : LocatedEvent :=
+      { atToken s lead consumed (.start name #[]) pairs base with
+        event := .start name #[] }
+    -- The span ranges are buffer-relative and contiguous only when the whole
+    -- name was scanned from this buffer. A name whose head came from an earlier
+    -- feed or the encoding probe is not contiguous here, so that event keeps its
+    -- owned payload and the sink copies from it.
+    let started : LocatedEvent :=
+      if havePrefix then
+        { anchored with event := .start name (materializeAttrs chunk ranges) }
+      else
+        { anchored with nameSpan := some ⟨nameStart, nameStop⟩, attrRanges := some ranges }
+    let closed : LocatedEvent := atToken s lead consumed (.end name) 0 base
+    if empty then
+      let phase := if s.phase == .prolog then Phase.epilog else s.phase
+      let s2 := tokenContinuation s lead consumed phase (resumeMode phase)
+        s.stack s.depth "" #[] #[] false s.textStarted
+      let close :=
+        if havePrefix then closed
+        else { closed with nameSpan := some ⟨nameStart, nameStop⟩ }
+      return .done s2 (.two started close) k
+    else
+      let s2 := tokenContinuation s lead consumed .content .contentStart
+        (name :: s.stack) (s.depth + 1) "" #[] #[] false s.textStarted
+      return .done s2 (.one started) k
+
+/-- The result of one start-tag step: a committed continuation, a demand to
+settle the carried prefix through the per-byte machine, a refusal that must not
+be retried on the next byte of the same feed, or a statement that the ordinary
+path owns these bytes. -/
+private inductive TagStep where
+  /-- A committed step. `owner` is the buffer the returned events' spans refer
+  to: the chunk being fed, or the carried prefix and chunk a tag was committed
+  from. Each event already names its buffer's absolute base. -/
+  | step (s : Stream) (evs : StepEvents) (next : Nat) (owner : ByteArray)
+  | replay
+  | refused
+  | pass
+
+namespace TagStep
+
+/-- True when the scanner examined these bytes and cannot commit the tag from
+here, so retrying from the next byte of the same feed cannot succeed either. -/
+def isRefused : TagStep → Bool
+  | .refused => true
+  | _ => false
+
+end TagStep
+
+/-- The markup state the per-byte machine enters on `<`, with the cursor
+advanced past that byte. `markupIndex` counts the scalars before the `<`. -/
+private def openMarkup (s : Stream) : Stream :=
+  { s with mode := .markup,
+           markupOffset := s.rawConsumed,
+           markupLine := s.line,
+           markupColumn := s.column,
+           markupIndex := s.charIndex,
+           charLine := s.line,
+           charColumn := s.column,
+           rawConsumed := s.rawConsumed + 1,
+           charIndex := s.charIndex + 1,
+           column := s.column + 1,
+           prevRawCR := false }
+
+/-- True when `chunk` holds a `>` at or after `from`. A tag with no `>` in these
+bytes cannot complete in them, so the scanner can skip the attempt -- and the
+conversion of the unfinished name it would have to build -- and keep the bytes
+unconsumed instead. -/
+private def hasTagEnd (chunk : ByteArray) (first : Nat) : Bool :=
+  findByte chunk 0x3E first < chunk.size
+
+/-- The most bytes one carried start tag may copy across all of its feeds. A tag
+that arrives in small chunks is rewritten each time the next chunk arrives, so
+an unbounded prefix would make the copying quadratic in the tag's length; past
+this budget the carry settles through the per-byte machine instead. -/
+private def tagCarryCopyLimit : Nat := 256 * 1024
+
+/-- Hold the bytes from `i` to the end of the chunk: the tag continues past
+them. -/
+private def tagStepHold (s : Stream) (chunk : ByteArray) (i : Nat) : TagStep :=
+  let held := chunk.extract i chunk.size
+  -- Bytes are held unconsumed, so they are not charged to the raw-input budget
+  -- until they are settled. A hold that would carry the parser past that budget
+  -- is refused here, which keeps the budget's exact fault and offset unchanged.
+  if held.size ≤ tagCarryLimit && s.rawConsumed + held.size ≤ s.limits.maxInputBytes then
+    .step { s with tagCarry := held, tagCarryCopied := 0 } .none chunk.size
+      ByteArray.empty
+  else .pass
+
+/-- Append the whole chunk to the carried prefix, keeping the tag unconsumed.
+
+The append copies the carried prefix, so it is taken while the new bytes are at
+least a quarter of the prefix, which makes the growth geometric, and also while
+the prefix is still inside this tag's copy budget, which keeps a tag that arrives
+in small chunks on the scanner instead of the per-byte machine. Past that budget
+a smaller chunk settles the prefix through the per-byte machine instead
+(`replay`), which is also what happened before the prefix was ever held. -/
+private def tagStepExtend (s : Stream) (chunk : ByteArray) : TagStep :=
+  let combined := s.tagCarry.append chunk
+  if combined.size ≤ tagCarryLimit &&
+      s.rawConsumed + combined.size ≤ s.limits.maxInputBytes &&
+      (chunk.size * 4 ≥ s.tagCarry.size ||
+        s.tagCarryCopied + combined.size ≤ tagCarryCopyLimit) then
+    .step { s with
+      tagCarry := combined, tagCarryCopied := s.tagCarryCopied + combined.size }
+      .none chunk.size ByteArray.empty
+  else .replay
+
+/-- One start-tag step over `chunk`, whose element name begins at `i`. `lead` is
+`1` when the buffer also holds the `<` immediately before that name, and `0` when
+an earlier step already consumed and charged that byte; `chunkBase` is the
+absolute offset of the buffer's first byte. -/
+private def tagStep (s : Stream) (chunk : ByteArray) (i : Nat) (nameHead : String)
+    (havePrefix : Bool) (lead chunkBase : Nat) : TagStep :=
+  if !s.tagCarry.isEmpty then
+    let combined := s.tagCarry.append chunk
+    match scanStartTag s combined 0 nameHead havePrefix 0 s.rawConsumed with
+    | .done st' evs' j =>
+      if j < s.tagCarry.size then .replay
+      -- The carried bytes are consumed by the commit, so the continuation must
+      -- not still reference them. The events' spans name `combined`, whose first
+      -- byte sits at the offset the stream still holds for the tag's start.
+      else .step { st' with tagCarry := ByteArray.empty, tagCarryCopied := 0 } evs'
+        (j - s.tagCarry.size) combined
+    | .fail st' => .step { st' with tagCarry := ByteArray.empty, tagCarryCopied := 0 }
+        .none chunk.size ByteArray.empty
+    | .more => tagStepExtend s chunk
+    | .refuse => .replay
+  else
+    if !havePrefix && !asciiNameStart (byteAt chunk i) then .pass
+    else
+      match scanStartTag s chunk i nameHead havePrefix lead chunkBase with
+      | .done st' evs' j =>
+        .step { st' with tagCarry := ByteArray.empty, tagCarryCopied := 0 } evs' j
+          chunk
+      | .fail st' =>
+        .step { st' with tagCarry := ByteArray.empty, tagCarryCopied := 0 } .none
+          chunk.size ByteArray.empty
+      | .more =>
+        -- The tag continues past this chunk. Consuming the `<` first keeps the
+        -- held bytes' anchors and budgets those of the tag's first byte, which
+        -- is the shape the carry path resumes from.
+        if lead == 1 then tagStepHold (openMarkup s) chunk i
+        else tagStepHold s chunk i
+      | .refuse => if havePrefix then .refused else .pass
+
+/-- Scan an end tag whose `</` begins at `i`, the index of its `/`. -/
+private def scanEndTag (s : Stream) (chunk : ByteArray) (i : Nat) (lead base : Nat) :
+    Bulk :=
+  Id.run do
+    let n := chunk.size
+    if !leadLt chunk lead i then return none
+    let nameStart := i + 1
+    if !asciiNameStart (byteAt chunk nameStart) then return none
+    let nameStop := nameEnd chunk n nameStart
+    if nameStop ≥ n then return none
+    if nameStop - nameStart > s.limits.maxTokenChars then return none
+    let k0 := spaceEnd chunk nameStop
+    if k0 ≥ n then return none
+    if byteAt chunk k0 != 0x3E then return none
+    let k := k0 + 1
+    let name := stringOfUtf8 (chunk.extract nameStart nameStop)
+    match s.stack.head? with
+    | none => return none
+    | some top =>
+      if top != name then return none
+    let consumed := k - i
+    if consumed > s.limits.maxInputBytes - (s.rawConsumed + lead) then return none
+    let stack := s.stack.tail
+    -- The name was scanned from this chunk, so the sink can copy it from the
+    -- span instead of the owned string.
+    let ended : LocatedEvent :=
+      { atToken s lead consumed (.end name) 0 base with
+        nameSpan := some ⟨nameStart, nameStop⟩ }
+    let phase := if stack.isEmpty then Phase.epilog else s.phase
+    let mode := if stack.isEmpty then Mode.epilogStart else Mode.contentStart
+    let continued := tokenContinuation s lead consumed phase mode stack (s.depth - 1)
+      s.elemName s.attrs s.buf s.spaced s.textStarted
+    return some (continued, .one ended, k)
+
+/-- Scan a comment whose `!` begins at `i`. -/
+private def scanComment (s : Stream) (chunk : ByteArray) (i : Nat) (lead base : Nat) :
+    Bulk :=
+  Id.run do
+    if !leadLt chunk lead i then return none
+    if byteAt chunk i != 0x21 || byteAt chunk (i + 1) != 0x2D ||
+        byteAt chunk (i + 2) != 0x2D then
+      return none
+    let dataStart := i + 3
+    match commentEnd chunk dataStart with
+    | .illegal => return none
+    | .missing => return none
+    | .at close =>
+      if close - dataStart > s.limits.maxTokenChars then return none
+      let consumed := close + 3 - i
+      if consumed > s.limits.maxInputBytes - (s.rawConsumed + lead) then return none
+      let data := stringOfUtf8 (chunk.extract dataStart close)
+      let continued := tokenContinuation s lead consumed s.phase (resumeMode s.phase)
+        s.stack s.depth s.elemName s.attrs #[] s.spaced s.textStarted
+      let ev : LocatedEvent := atToken s lead consumed (.comment data) 0 base
+      return some (continued, .one ev, close + 3)
+
+/-- The target of a processing instruction is an `xml` variant, so the per-byte
+machine owns it and reports its exact diagnosis. The scanner only accepts ASCII
+name characters, so comparing the scanned bytes in either case settles the
+lowercase comparison the grammar makes. -/
+private def isXmlPiTarget (chunk : ByteArray) (start stop : Nat) : Bool :=
+  stop - start == 3 &&
+    (let b0 := byteAt chunk start
+     let b1 := byteAt chunk (start + 1)
+     let b2 := byteAt chunk (start + 2)
+     (b0 == 0x78 || b0 == 0x58) && (b1 == 0x6D || b1 == 0x4D) &&
+       (b2 == 0x6C || b2 == 0x4C))
+
+/-- Scan a processing instruction whose `?` begins at `i`. An `xml` target is
+left to the per-byte machine so its exact diagnosis is preserved. -/
+private def scanPi (s : Stream) (chunk : ByteArray) (i : Nat) (lead base : Nat) : Bulk :=
+  Id.run do
+    let n := chunk.size
+    if !leadLt chunk lead i then return none
+    if byteAt chunk i != 0x3F then return none
+    let targetStart := i + 1
+    if !asciiNameStart (byteAt chunk targetStart) then return none
+    let targetStop := nameEnd chunk n targetStart
+    if targetStop ≥ n then return none
+    if targetStop - targetStart > s.limits.maxTokenChars then return none
+    if isXmlPiTarget chunk targetStart targetStop then return none
+    let target := stringOfUtf8 (chunk.extract targetStart targetStop)
+    let mut dataStart := targetStop
+    let mut dataStop := targetStop
+    let mut stopIndex := 0
+    if byteAt chunk targetStop == 0x3F then
+      if byteAt chunk (targetStop + 1) != 0x3E then return none
+      stopIndex := targetStop + 2
+    else if byteAt chunk targetStop == 0x20 then
+      let afterSpace := spaceEnd chunk targetStop
+      if afterSpace ≥ n then return none
+      dataStart := afterSpace
+      match piDataEnd chunk afterSpace with
+      | .illegal => return none
+      | .missing => return none
+      | .at j =>
+        dataStop := j
+        stopIndex := j + 2
+      if dataStop - dataStart > s.limits.maxTokenChars then return none
+    else return none
+    let data := stringOfUtf8 (chunk.extract dataStart dataStop)
+    let consumed := stopIndex - i
+    if consumed > s.limits.maxInputBytes - (s.rawConsumed + lead) then return none
+    let continued := tokenContinuation s lead consumed s.phase (resumeMode s.phase)
+      s.stack s.depth s.elemName s.attrs #[] s.spaced s.textStarted
+    let ev : LocatedEvent := atToken s lead consumed (.pi target data) 0 base
+    return some (continued, .one ev, stopIndex)
+
+/-- Scan a CDATA section whose `!` begins at `i`. -/
+private def scanCdata (s : Stream) (chunk : ByteArray) (i : Nat) (lead base : Nat) : Bulk :=
+  Id.run do
+    if !leadLt chunk lead i then return none
+    if byteAt chunk i != 0x21 || byteAt chunk (i + 1) != 0x5B ||
+        byteAt chunk (i + 2) != 0x43 || byteAt chunk (i + 3) != 0x44 ||
+        byteAt chunk (i + 4) != 0x41 || byteAt chunk (i + 5) != 0x54 ||
+        byteAt chunk (i + 6) != 0x41 || byteAt chunk (i + 7) != 0x5B then
+      return none
+    let dataStart := i + 8
+    match cdataEnd chunk dataStart with
+    | .illegal => return none
+    | .missing => return none
+    | .at close =>
+      if close - dataStart > s.limits.maxTokenChars then return none
+      let consumed := close + 3 - i
+      if consumed > s.limits.maxInputBytes - (s.rawConsumed + lead) then return none
+      let continued := tokenContinuation s lead consumed s.phase .contentStart
+        s.stack s.depth s.elemName s.attrs #[] s.spaced false
+      -- CDATA content is literal: keep it a span of this chunk and let the
+      -- consumer materialize it only if it needs an owned string.
+      let textEv : Option LocatedEvent :=
+        if close == dataStart then none
+        else
+          some { event := .text ""
+                 byteOffset := tokenOffset s lead + 1 + (dataStart - i)
+                 tokenBytes := none
+                 line := s.line
+                 column := tokenColumn s lead + 1 + (dataStart - i)
+                 specifiedAttrs := 0
+                 textSpan := some ⟨dataStart, close⟩ }
+      let closeEv : LocatedEvent :=
+        { event := .cdataEnd
+          byteOffset := tokenOffset s lead + 1 + (close - i)
+          tokenBytes := some 3
+          line := s.line
+          column := tokenColumn s lead + 1 + (close - i)
+          specifiedAttrs := 0 }
+      let opener : LocatedEvent :=
+        { atToken s lead consumed .cdataStart 0 base with
+          tokenBytes := some (dataStart - i + 1) }
+      let evs : StepEvents :=
+        match textEv with
+        | none => .two opener closeEv
+        | some content => .three opener content closeEv
+      return some (continued, evs, close + 3)
+
+/-- The construct a markup token beginning at `i` (its first byte after the `<`)
+is, when the bulk scanners can commit it whole: an end tag, a comment, a CDATA
+section, a processing instruction or a start tag. Anything else is `pass`, which
+leaves the byte to the machine below. -/
+private def markupDispatch (s : Stream) (chunk : ByteArray) (i : Nat) (lead base : Nat) :
+    TagStep :=
+  if !s.tagCarry.isEmpty then
+    -- The carried prefix owns the tag, so this chunk continues it whatever its
+    -- first byte is.
+    tagStep s chunk i "" false 0 base
+  else
+  let b := byteAt chunk i
+  if b == 0x2F then
+    if s.phase == .prolog || s.phase == .epilog then .pass
+    else
+      match scanEndTag s chunk i lead base with
+      | some (st', evs', j) => .step st' evs' j chunk
+      | none => .pass
+  else if b == 0x21 then
+    if byteAt chunk (i + 1) == 0x2D then
+      match scanComment s chunk i lead base with
+      | some (st', evs', j) => .step st' evs' j chunk
+      | none => .pass
+    else if byteAt chunk (i + 1) == 0x5B then
+      if s.phase == .content then
+        match scanCdata s chunk i lead base with
+        | some (st', evs', j) => .step st' evs' j chunk
+        | none => .pass
+      else .pass
+    else .pass
+  else if b == 0x3F then
+    match scanPi s chunk i lead base with
+    | some (st', evs', j) => .step st' evs' j chunk
+    | none => .pass
+  else if asciiNameStart b then
+    if s.phase == .epilog then .pass else tagStep s chunk i "" false lead base
+  else .pass
+
+/-- Attach a committed step's events after the text a `<` flushed. The flushed
+token is still a span of `chunk`, which is therefore the buffer the delivered
+events name -- including when the step itself held the tag for a later feed. -/
+private def withFlush (flush : StepEvents) (chunk : ByteArray) : TagStep → TagStep
+  | .step st' evs' j _ => .step st' (stepThen flush evs') j chunk
+  | other => other
+
+/-- A `<` and the construct it opens, committed as one step: the text token that
+ends at the `<` is flushed and the construct is scanned from the same buffer, so
+one iteration and one continuation update cover both. `pass` leaves the byte to
+the machine below, which is what happens for an unfinished scalar, a deferred CR,
+a construct the scanners do not fully understand and a mode where `<` does not
+start markup. -/
+private def foldMarkup (s : Stream) (chunk : ByteArray) (i : Nat) (base : Nat) : TagStep :=
+  if !s.pending.isEmpty || s.pendingCR || !s.tagCarry.isEmpty then .pass
+  else if byteAt chunk i != 0x3C then .pass
+  else
+    let (flushed, flush) := flushTextStep s
+    match markupDispatch flushed chunk (i + 1) 1 base with
+    | .pass => .pass
+    | step => withFlush flush chunk step
+
+/-- One bulk step over `chunk` at `i`.
+
+A tag whose bytes so far are a well-formed prefix and whose remainder is not in
+this chunk is held **unconsumed** in `tagCarry`: its bytes are not charged to
+the stream yet, so the tag's position, budgets and event anchors stay those of
+its first byte. A later feed scans the carried prefix and the new bytes once, so
+a tag crossing a feed boundary costs one scan instead of one scalar push per
+byte. `replay` settles the carried prefix through the per-byte machine, which is
+also what happens without this step, and `refused` suppresses a retry on the
+next byte of the same feed for the same reason. -/
+private def scanTagStep (s : Stream) (chunk : ByteArray) (i : Nat)
+    (chunkBase : Nat) : TagStep :=
+  -- Bulk scanning reads one byte per character, so it is limited to the
+  -- byte-oriented encodings; UTF-16 code units are decoded only by the per-byte
+  -- machine.
+  match s.enc with
+  | .decided .utf8 | .decided .ascii | .decided .latin1 =>
+    scanTagStepBytes s chunk i chunkBase
+  | _ => .pass
+where
+  scanTagStepBytes (s : Stream) (chunk : ByteArray) (i : Nat) (chunkBase : Nat) :
+      TagStep :=
+  match s.mode with
+  | .markup =>
+    markupDispatch s chunk i 0 chunkBase
+  | .text | .contentStart | .prologStart | .epilogStart =>
+    foldMarkup s chunk i chunkBase
+  | .startNameRest =>
+    -- The unfinished name is an `Array Char`; turning it into the scanner's
+    -- prefix costs one pass over the token, so it happens only when these bytes
+    -- can actually complete the tag. Otherwise the bytes are held unconsumed and
+    -- the tag is scanned once, when the terminator arrives.
+    let ready := hasTagEnd chunk i
+    if s.phase == .epilog then .pass
+    else if s.bulkTagTried then .pass
+    else if !ready then
+      if s.tagCarry.isEmpty then tagStepHold s chunk i else tagStepExtend s chunk
+    else
+      let carried := bufferString s.buf
+      if carried.toList.all (fun c => c.toNat < 0x80) then
+        -- A carried prefix is scanned from the start of the combined buffer,
+        -- whose first byte is the stream's current offset; a tag scanned in the
+        -- chunk itself is indexed from the chunk's first byte.
+        tagStep s chunk (if s.tagCarry.isEmpty then i else 0) carried true 0
+          (if s.tagCarry.isEmpty then chunkBase else s.rawConsumed)
+      else if s.tagCarry.isEmpty then .refused
+      -- A name that is not ASCII cannot be scanned in bulk, and the carried
+      -- bytes precede this chunk: they must be settled before the per-byte
+      -- machine may read past them.
+      else .replay
+  | _ => .pass
+
+/-! ## Bulk data delimiters
+
+Two constructs recur once per element or once per reference and do not need a
+decoded-scalar step per byte: the `<` that opens a markup token is one byte in
+every byte-oriented encoding, and a complete numeric character reference is a
+bounded ASCII run whose expansion is exactly one scalar. Both are committed here
+with one state update. Anything this scanner does not fully understand is left
+to the per-byte machine, which reports the identical code, reason, offset, line
+and column. -/
+
+/-- A `<` that opens markup, consumed as one step. `none` leaves the byte to the
+per-byte machine: an unfinished scalar, a deferred CR, a `]`-bracket lookahead
+in text, or a mode where `<` is not what starts markup. -/
+private def bulkOpenMarkup (s : Stream) (chunk : ByteArray) (i : Nat) :
+    Option (Stream × Array LocatedEvent × Nat) :=
+  match s.enc with
+  | .decided enc =>
+    match enc with
+    | .utf8 | .ascii | .latin1 =>
+      if !s.pending.isEmpty || s.pendingCR then none
+      else if chunk[i]? != some 0x3C then none
+      else
+        let advanced := openMarkup s
+        match s.mode with
+        | .text =>
+          -- The run ends at this byte: the per-byte machine advances the cursor
+          -- and then flushes, so the advance happens first here too.
+          let (s1, evs) := flushText advanced #[]
+          some (s1, evs, i + 1)
+        | .contentStart | .prologStart | .epilogStart => some (advanced, #[], i + 1)
+        | _ => none
+    | _ => none
+  | _ => none
+
+/-- A complete numeric character reference, consumed as one step with its
+expansion appended to the text token. `none` leaves the bytes to the per-byte
+machine, which reports a malformed, unterminated, over-budget or out-of-range
+reference, an exhausted reference budget or an over-budget text token with its
+own offset, line and column. -/
+private def bulkCharRef (s : Stream) (chunk : ByteArray) (i : Nat) :
+    Option (Stream × Nat) :=
+  match s.enc, s.mode with
+  | .decided .utf8, .text | .decided .utf8, .contentStart
+  | .decided .ascii, .text | .decided .ascii, .contentStart
+  | .decided .latin1, .text | .decided .latin1, .contentStart =>
+    if !s.pending.isEmpty || s.pendingCR then none
+    else if chunk[i]? != some 0x26 || chunk[i + 1]? != some 0x23 then none
+    else Id.run do
+      let mut k := i + 2
+      let hex := chunk[k]? == some 0x78
+      if hex then k := k + 1
+      let mut value := 0
+      let mut digits := 0
+      let mut overflow := false
+      let mut stop := false
+      while !stop do
+        match chunk[k]? with
+        | none => return none
+        | some b =>
+          match (if hex then hexDigitValue b.toNat else decDigitValue b.toNat) with
+          | none => stop := true
+          | some dv =>
+            digits := digits + 1
+            if !overflow then
+              let nextValue := value * (if hex then 16 else 10) + dv
+              if nextValue > 0x10FFFF then overflow := true else value := nextValue
+            k := k + 1
+            if digits ≥ s.limits.maxTokenChars then return none
+      if digits == 0 then return none
+      if overflow then return none
+      if chunk[k]? != some 0x3B then return none
+      -- The budgets and the XML `Char` range decide refusal; the per-byte
+      -- machine is where their exact code and offset are reported.
+      if s.entityUsed + 1 > s.limits.maxEntityExpansion then return none
+      if s.textChars >= s.limits.maxTokenChars then return none
+      if !isXmlChar value then return none
+      let consumed := k + 1 - i
+      if consumed > s.limits.maxInputBytes - s.rawConsumed then return none
+      let started :=
+        noteTextStart (materializeTextSpan s chunk) s.rawConsumed s.line s.column
+      return some ({ started with
+        textPieces := started.textPieces.push (scalarUtf8 value),
+        textChars := started.textChars + 1,
+        entityUsed := started.entityUsed + 1,
+        mode := .text,
+        rawConsumed := s.rawConsumed + consumed,
+        charIndex := s.charIndex + consumed,
+        column := s.column + consumed,
+        prevRawCR := false,
+        refBuf := #[] }, k + 1)
+  | _, _ => none
+
 /-- Offer each determined event to the sink in order and, when `collect` is
 set, append it to the returned array. The sink's `false` stops the parse: the
 C bridge reports an abort through its own terminal state, so the stream itself
 stays as it was. -/
-private def deliverEvents (collect : Bool) (sink : LocatedEvent → Bool)
+private def deliverEvents (collect : Bool) (owner : ByteArray)
+    (sink : ByteArray → LocatedEvent → Bool)
     (acc : Array LocatedEvent) (evs : Array LocatedEvent) :
     Bool × Array LocatedEvent :=
-  Id.run do
+  if evs.isEmpty then (true, acc)
+  else Id.run do
     let mut acc := acc
     let mut ok := true
     for e in evs do
       if ok then
-        ok := sink e
-        if collect then acc := acc.push e
+        let framed := if collect then materializeEvent owner e else e
+        ok := sink owner framed
+        if collect then acc := acc.push framed
     return (ok, acc)
 
-private def feedDecoded (collect : Bool) (sink : LocatedEvent → Bool)
+/-- Offer one bulk-step event: the sink sees it at once, and the pure API's
+accumulator records it. -/
+private def deliverOne (collect : Bool) (owner : ByteArray)
+    (sink : ByteArray → LocatedEvent → Bool) (acc : Array LocatedEvent)
+    (e : LocatedEvent) : Bool × Array LocatedEvent :=
+  let framed := if collect then materializeEvent owner e else e
+  let ok := sink owner framed
+  (ok, if collect then acc.push framed else acc)
+
+/-- Offer a bulk step's events in document order, without an intermediate array.
+Delivery stops at the first event the sink refuses, exactly as the array form
+does. -/
+private def deliverStep (collect : Bool) (owner : ByteArray)
+    (sink : ByteArray → LocatedEvent → Bool) (acc : Array LocatedEvent)
+    (evs : StepEvents) : Bool × Array LocatedEvent :=
+  match evs with
+  | .none => (true, acc)
+  | .one a => deliverOne collect owner sink acc a
+  | .two a b =>
+    match deliverOne collect owner sink acc a with
+    | (true, acc) => deliverOne collect owner sink acc b
+    | (false, acc) => (false, acc)
+  | .three a b c =>
+    match deliverOne collect owner sink acc a with
+    | (true, acc) => match deliverOne collect owner sink acc b with
+      | (true, acc) => deliverOne collect owner sink acc c
+      | (false, acc) => (false, acc)
+    | (false, acc) => (false, acc)
+  | .four a b c d =>
+    match deliverOne collect owner sink acc a with
+    | (true, acc) => match deliverOne collect owner sink acc b with
+      | (true, acc) => match deliverOne collect owner sink acc c with
+        | (true, acc) => deliverOne collect owner sink acc d
+        | (false, acc) => (false, acc)
+      | (false, acc) => (false, acc)
+    | (false, acc) => (false, acc)
+
+private def feedDecoded (collect : Bool) (sink : ByteArray → LocatedEvent → Bool)
     (s : Stream) (evs : Array LocatedEvent) (data : ByteArray) (base : Nat) :
     Stream × Array LocatedEvent × Bool :=
   Id.run do
@@ -1283,11 +2556,11 @@ private def feedDecoded (collect : Bool) (sink : LocatedEvent → Bool)
           match decodeByte st b (base + (j - 1)) with
           | .needMore st' => st := st'
           | .progressed st' evs' =>
-            let (ok', acc') := deliverEvents collect sink acc evs'
+            let (ok', acc') := deliverEvents collect data sink acc evs'
             st := st'; acc := acc'; ok := ok'
             if !ok then stop := true
           | .failed st' evs' =>
-            let (ok', acc') := deliverEvents collect sink acc evs'
+            let (ok', acc') := deliverEvents collect data sink acc evs'
             st := st'; acc := acc'; ok := ok'; stop := true
         | none => stop := true
     return (st, acc, ok)
@@ -1352,7 +2625,7 @@ private def probeAction (buf : ByteArray) : ProbeAction :=
       | none => .wait
   else .decide
 
-private def replayProbe (collect : Bool) (sink : LocatedEvent → Bool)
+private def replayProbe (collect : Bool) (sink : ByteArray → LocatedEvent → Bool)
     (s : Stream) (enc : Encoding) (skip : Nat) (buf : ByteArray) :
     Stream × Array LocatedEvent × Bool :=
   let fresh : Stream :=
@@ -1363,7 +2636,7 @@ private def replayProbe (collect : Bool) (sink : LocatedEvent → Bool)
              textStarted := false, failSet := false }
   feedDecoded collect sink fresh #[] (buf.extract skip buf.size) skip
 
-private def decideFromProbe (collect : Bool) (sink : LocatedEvent → Bool)
+private def decideFromProbe (collect : Bool) (sink : ByteArray → LocatedEvent → Bool)
     (s : Stream) (buf : ByteArray) : Stream × Array LocatedEvent × Bool :=
   match chooseEncoding buf s.limits.maxTokenChars with
   | .error e => (noteFailure (failedWith s e), #[], true)
@@ -1372,14 +2645,18 @@ private def decideFromProbe (collect : Bool) (sink : LocatedEvent → Bool)
 /-- The streaming core with an optional per-event sink. Events are offered at
 the point the grammar determines them, before later bytes of the same chunk are
 decoded. `collect` also accumulates them for the pure API. -/
-private def feedCore (collect : Bool) (sink : LocatedEvent → Bool)
+private def feedCore (collect : Bool) (sink : ByteArray → LocatedEvent → Bool)
     (s : Stream) (chunk : ByteArray) : Stream × Array LocatedEvent :=
   match s.status with
   | .active =>
     if chunk.size == 0 then (s, #[])
     else
       Id.run do
-        let mut st := s
+        -- The absolute offset of this chunk's first byte. A start tag held over
+        -- from an earlier feed sits between the consumed prefix and these bytes,
+        -- so it is counted here; spans this feed commits name this chunk.
+        let feedBase := s.rawConsumed + s.tagCarry.size
+        let mut st := { s with bulkTagTried := false }
         let mut acc : Array LocatedEvent := #[]
         let mut i := 0
         let mut stop := false
@@ -1390,109 +2667,201 @@ private def feedCore (collect : Bool) (sink : LocatedEvent → Bool)
             st := failHere st .limitInput "limitInput" st.rawConsumed
             stop := true
           else
-            match chunk[i]? with
-            | none => stop := true
-            | some b =>
-              let off := st.rawConsumed
-              i := i + 1
-              st := { st with rawConsumed := st.rawConsumed + 1 }
-              match st.enc with
-              | .probing buf =>
-                let buf' := buf.push b
-                match probeAction buf' with
-                | .wait => st := { st with enc := .probing buf' }
-                | .declaration =>
-                  -- The whitespace that identified the declaration is already
-                  -- consumed, so the shadow resumes at the version name.
-                  st := { st with enc := .declaration buf',
-                                   mode := .decl .versionNameSkipWs }
-                | .signature enc skip =>
-                  let (st', evs', ok) := replayProbe collect sink st enc skip buf'
-                  st := st'
-                  acc := pushEvents acc evs'
-                  if !ok || !isActive st then stop := true
-                | .decide =>
-                  let (st', evs', ok) := decideFromProbe collect sink st buf'
-                  st := st'
-                  acc := pushEvents acc evs'
-                  if !ok || !isActive st then stop := true
-              | .declaration buf =>
-                -- Drop the stream's reference to the prefix before appending, so
-                -- the append is the sole owner of the buffer and stays linear.
-                st := { st with enc := .probing ByteArray.empty }
-                let buf' := buf.push b
-                let j := buf'.size - 1
-                -- The declaration grammar runs synchronously on the buffered
-                -- ASCII bytes, using the lexical fields the undecided encoding
-                -- leaves unused. Reusing `st` itself keeps the character buffer
-                -- uniquely owned, so this stays linear in the prefix length.
-                let hint : Option Encoding :=
-                  match st.mode with
-                  | .decl (.secondValue quote) =>
-                    if b.toNat == quote.toNat then labelEncoding st.buf
-                    else none
-                  | _ => none
-                let st1 : Stream :=
-                  if !st.declShadow then
-                    { st with enc := .declaration buf', declShadow := false }
-                  else if h : b.toNat < 0x80 then
-                    match hint with
-                    | some enc =>
-                      -- One copy of the value buffer: the label decides the
-                      -- encoding the declaration will be checked against.
-                      let (s', _) :=
-                        runStep 8 { st with enc := .decided enc }
-                          ⟨⟨b.toNat, Or.inl (by omega)⟩, off⟩
-                      { s' with enc := .declaration buf' }
-                    | none =>
-                      let (s', _) := runStep 8 st
-                        ⟨⟨b.toNat, Or.inl (by omega)⟩, off⟩
-                      { s' with enc := .declaration buf' }
-                  else
-                    match nonAsciiDeclFault st with
-                    | some (code, reason) => failCode st code reason off
-                    | none => { st with enc := .declaration buf', declShadow := false }
-                let shadowLive :=
-                  st1.declShadow &&
-                    (match st1.mode with
-                      | .decl _ => true
-                      | _ => false)
-                st := { st1 with declShadow := shadowLive }
-                if !isActive st then
+            -- The scanners first try to commit the whole construct that
+            -- begins here -- with the `<` that opens it, or a start tag that
+            -- may continue past this chunk. What they do not fully understand
+            -- falls back to the steps below, and finally to the per-byte
+            -- machine, from the unchanged state.
+            let step := scanTagStep st chunk i feedBase
+            if step.isRefused then st := { st with bulkTagTried := true }
+            match step with
+            | .step st' evs' j owner =>
+              let (ok', acc') := deliverStep collect owner sink acc evs'
+              st := st'
+              acc := acc'
+              i := j
+              if !ok' || !isActive st' then stop := true
+            | .replay =>
+              -- The carried prefix is a tag this scanner cannot commit: charge
+              -- its bytes and settle it through the per-byte machine, which is
+              -- where those bytes would have gone without the carry.
+              let base := st.rawConsumed
+              let carried := st.tagCarry
+              let settled := { st with
+                tagCarry := ByteArray.empty, tagCarryCopied := 0,
+                rawConsumed := st.rawConsumed + carried.size }
+              let (st1, evs1, ok1) := feedDecoded collect sink settled acc carried base
+              st := st1
+              acc := evs1
+              if !ok1 || !isActive st1 then stop := true
+            | .refused | .pass =>
+            match bulkOpenMarkup st chunk i with
+            | some (st', evs', j) =>
+              let (ok', acc') := deliverStep collect chunk sink acc
+                (stepEventsOfFlush evs')
+              st := st'
+              acc := acc'
+              i := j
+              if !ok' || !isActive st' then stop := true
+            | none =>
+            match bulkCharRef st chunk i with
+            | some (st', j) =>
+              st := st'
+              i := j
+            | none =>
+              let run := scanTextRun st chunk i
+              if run.len > 0 then
+                let s0 := noteTextStart st st.rawConsumed st.line st.column
+                let allowance := s0.limits.maxTokenChars - s0.textChars
+                if run.chars > allowance then
+                  let failed := failCode s0 .limitToken "limitToken"
+                    (s0.rawConsumed + allowance)
+                  st := { failed with
+                    failLine := s0.line,
+                    failColumn := s0.column + run.chars,
+                    failSet := true }
                   stop := true
-                else if j ≥ 6 && buf'[j - 1]? == some 0x3F && b == 0x3E &&
-                    j < st.limits.maxTokenChars then
-                  let (st', evs', ok) := decideFromProbe collect sink st buf'
-                  st := st'
-                  acc := pushEvents acc evs'
-                  if !ok || !isActive st then stop := true
-                else if buf'.size ≥ st.limits.maxTokenChars then
-                  let (st', evs', ok) := decideFromProbe collect sink st buf'
-                  st := st'
-                  acc := pushEvents acc evs'
-                  if !ok || !isActive st then stop := true
-              | .decided _ =>
-                match decodeByte st b off with
-                | .needMore st' => st := st'
-                | .progressed st' evs' =>
-                  let (ok', acc') := deliverEvents collect sink acc evs'
-                  st := st'; acc := acc'
-                  if !ok' then stop := true
-                | .failed st' evs' =>
-                  let (ok', acc') := deliverEvents collect sink acc evs'
-                  st := st'; acc := acc'; stop := true
-        return (noteFailure st, acc)
+                else if run.converted.isNone && s0.textPieces.isEmpty then
+                  -- A literal run of this chunk with nothing carried yet: keep
+                  -- the token as a borrowed span instead of copying its bytes. A
+                  -- consumer that needs an owned string materializes it at the
+                  -- delivery boundary, and the end of the feed takes any
+                  -- unfinished span as a piece so no state outlives the chunk.
+                  let sp := match s0.textSpan with
+                    | some earlier => { earlier with stop := i + run.len }
+                    | none => { start := i, stop := i + run.len }
+                  st := { s0 with
+                    textSpan := some sp,
+                    mode := .text,
+                    textChars := s0.textChars + run.chars,
+                    column := s0.column + run.chars,
+                    charIndex := s0.charIndex + run.chars,
+                    rawConsumed := s0.rawConsumed + run.len }
+                  i := i + run.len
+                else
+                  -- A continuation of a token whose earlier bytes are already
+                  -- pieces, or a run the encoding had to convert: one piece for
+                  -- this run, so the copy is bounded by the run.
+                  let bytes :=
+                    match run.converted with
+                    | some converted => converted
+                    | none => chunk.extract i (i + run.len)
+                  st := { s0 with
+                    textPieces := s0.textPieces.push bytes,
+                    mode := .text,
+                    textChars := s0.textChars + run.chars,
+                    column := s0.column + run.chars,
+                    charIndex := s0.charIndex + run.chars,
+                    rawConsumed := s0.rawConsumed + run.len }
+                  i := i + run.len
+              else
+                match chunk[i]? with
+                | none => stop := true
+                | some b =>
+                  let off := st.rawConsumed
+                  i := i + 1
+                  -- The per-byte machine cannot borrow the chunk, and this byte
+                  -- ends the literal run, so a pending span becomes owned bytes
+                  -- before the grammar can append to the same token.
+                  st := materializeTextSpan st chunk
+                  st := { st with rawConsumed := st.rawConsumed + 1 }
+                  match st.enc with
+                  | .probing buf =>
+                    let buf' := buf.push b
+                    match probeAction buf' with
+                    | .wait => st := { st with enc := .probing buf' }
+                    | .declaration =>
+                      -- The whitespace that identified the declaration is already
+                      -- consumed, so the shadow resumes at the version name.
+                      st := { st with enc := .declaration buf',
+                                       mode := .decl .versionNameSkipWs }
+                    | .signature enc skip =>
+                      let (st', evs', ok) := replayProbe collect sink st enc skip buf'
+                      st := st'
+                      acc := pushEvents acc evs'
+                      if !ok || !isActive st then stop := true
+                    | .decide =>
+                      let (st', evs', ok) := decideFromProbe collect sink st buf'
+                      st := st'
+                      acc := pushEvents acc evs'
+                      if !ok || !isActive st then stop := true
+                  | .declaration buf =>
+                    -- Drop the stream's reference to the prefix before appending, so
+                    -- the append is the sole owner of the buffer and stays linear.
+                    st := { st with enc := .probing ByteArray.empty }
+                    let buf' := buf.push b
+                    let j := buf'.size - 1
+                    -- The declaration grammar runs synchronously on the buffered
+                    -- ASCII bytes, using the lexical fields the undecided encoding
+                    -- leaves unused. Reusing `st` itself keeps the character buffer
+                    -- uniquely owned, so this stays linear in the prefix length.
+                    let hint : Option Encoding :=
+                      match st.mode with
+                      | .decl (.secondValue quote) =>
+                        if b.toNat == quote.toNat then labelEncoding st.buf
+                        else none
+                      | _ => none
+                    let st1 : Stream :=
+                      if !st.declShadow then
+                        { st with enc := .declaration buf', declShadow := false }
+                      else if h : b.toNat < 0x80 then
+                        match hint with
+                        | some enc =>
+                          -- One copy of the value buffer: the label decides the
+                          -- encoding the declaration will be checked against.
+                          let (s', _) :=
+                            runStep 8 { st with enc := .decided enc }
+                              ⟨⟨b.toNat, Or.inl (by omega)⟩, off⟩
+                          { s' with enc := .declaration buf' }
+                        | none =>
+                          let (s', _) := runStep 8 st
+                            ⟨⟨b.toNat, Or.inl (by omega)⟩, off⟩
+                          { s' with enc := .declaration buf' }
+                      else
+                        match nonAsciiDeclFault st with
+                        | some (code, reason) => failCode st code reason off
+                        | none => { st with enc := .declaration buf', declShadow := false }
+                    let shadowLive :=
+                      st1.declShadow &&
+                        (match st1.mode with
+                          | .decl _ => true
+                          | _ => false)
+                    st := { st1 with declShadow := shadowLive }
+                    if !isActive st then
+                      stop := true
+                    else if j ≥ 6 && buf'[j - 1]? == some 0x3F && b == 0x3E &&
+                        j < st.limits.maxTokenChars then
+                      let (st', evs', ok) := decideFromProbe collect sink st buf'
+                      st := st'
+                      acc := pushEvents acc evs'
+                      if !ok || !isActive st then stop := true
+                    else if buf'.size ≥ st.limits.maxTokenChars then
+                      let (st', evs', ok) := decideFromProbe collect sink st buf'
+                      st := st'
+                      acc := pushEvents acc evs'
+                      if !ok || !isActive st then stop := true
+                  | .decided _ =>
+                    match decodeByte st b off with
+                    | .needMore st' => st := st'
+                    | .progressed st' evs' =>
+                      let (ok', acc') := deliverEvents collect chunk sink acc evs'
+                      st := st'; acc := acc'
+                      if !ok' then stop := true
+                    | .failed st' evs' =>
+                      let (ok', acc') := deliverEvents collect chunk sink acc evs'
+                      st := st'; acc := acc'; stop := true
+        return (materializeTextSpan (noteFailure st) chunk, acc)
   | _ => (s, #[])
 
 /-- Feed one chunk. Events determined by this chunk are returned immediately; a
 failure in this call still returns the events determined before it. -/
 def feedLocated (s : Stream) (chunk : ByteArray) : Stream × Array LocatedEvent :=
-  feedCore true (fun _ => true) s chunk
+  feedCore true (fun _ _ => true) s chunk
 
 /-- Feed one chunk, offering each determined event to `sink` as soon as the
 grammar determines it. The returned stream is the continuation; `false` from
 the sink stops the parse. -/
-def feedSink (sink : LocatedEvent → Bool) (s : Stream) (chunk : ByteArray) :
+def feedSink (sink : ByteArray → LocatedEvent → Bool) (s : Stream) (chunk : ByteArray) :
     Stream :=
   (feedCore false sink s chunk).1
 
@@ -1565,8 +2934,18 @@ private def finishMode (s : Stream) (evs : Array LocatedEvent) : Stream × Array
   | .epilogStart => ({ s with status := .done }, evs)
   | .contentStart => fail .noElements "unclosedElement"
   | .text => fail .noElements "unclosedElement"
-  | .textBracket1 => finishWithAppend s ']' .noElements "unclosedElement" evs
-  | .textBracket2 => finishWithAppend2 s .noElements "unclosedElement" evs
+  | .textBracket1 =>
+    (match appendTextScalar s 0x5D s.rawConsumed with
+     | (s1, some e) => (failedWith s1 e, evs)
+     | (s1, none) => (failedWith s1 ⟨.noElements, "unclosedElement", s.rawConsumed⟩, evs))
+  | .textBracket2 =>
+    (match appendTextScalar s 0x5D s.rawConsumed with
+     | (s1, some e) => (failedWith s1 e, evs)
+     | (s1, none) =>
+       match appendTextScalar s1 0x5D s.rawConsumed with
+       | (s2, some e) => (failedWith s2 e, evs)
+       | (s2, none) =>
+         (failedWith s2 ⟨.noElements, "unclosedElement", s.rawConsumed⟩, evs))
   | .markup =>
     match s.phase with
     | .epilog => fail .junkAfterDocElement "junkAfterRoot"
@@ -1625,13 +3004,17 @@ private def finishGrammar (s : Stream) (evs : Array LocatedEvent) : Stream × Ar
     let mapped : Char := match s.mode with
       | .attrValue _ => ' '
       | _ => '\n'
-    match appendChar s mapped s.rawConsumed with
+    let appended : Stream × Option ParseError :=
+      match s.mode with
+      | .text => appendTextScalar s mapped.toNat s.rawConsumed
+      | _ => appendChar s mapped s.rawConsumed
+    match appended with
     | (s1, some e) => (failedWith s1 e, evs)
     | (s1, none) => finishMode { s1 with pendingCR := false } evs
   else
     finishMode s evs
 
-private def finishUtf16 (collect : Bool) (sink : LocatedEvent → Bool)
+private def finishUtf16 (collect : Bool) (sink : ByteArray → LocatedEvent → Bool)
     (s : Stream) (evs : Array LocatedEvent) (bigEndian : Bool) :
     Stream × Array LocatedEvent :=
   match s.pending.size with
@@ -1646,7 +3029,7 @@ private def finishUtf16 (collect : Bool) (sink : LocatedEvent → Bool)
         | .ok (sc, _) =>
           let (s1, evs1) := stepChar { s with pending := ByteArray.empty }
             ⟨sc, s.pendingOffset⟩
-          let (ok, acc) := deliverEvents collect sink evs evs1
+          let (ok, acc) := deliverEvents collect ByteArray.empty sink evs evs1
           if ok && isActive s1 then finishGrammar s1 acc else (s1, acc)
         | .error e =>
           (failHere s e.reason.code e.reason.name (s.pendingOffset + e.offset), evs)
@@ -1654,7 +3037,7 @@ private def finishUtf16 (collect : Bool) (sink : LocatedEvent → Bool)
     | _, _ => (failHere s .partialChar "oddUtf16Length" s.pendingOffset, evs)
   | _ => (failHere s .partialChar "oddUtf16Length" s.pendingOffset, evs)
 
-private def finishDecoded (collect : Bool) (sink : LocatedEvent → Bool)
+private def finishDecoded (collect : Bool) (sink : ByteArray → LocatedEvent → Bool)
     (s : Stream) (evs : Array LocatedEvent) : Stream × Array LocatedEvent :=
   match s.enc with
   | .decided enc =>
@@ -1666,7 +3049,7 @@ private def finishDecoded (collect : Bool) (sink : LocatedEvent → Bool)
         | .ok (sc, _) =>
           let (s1, evs1) := stepChar { s with pending := ByteArray.empty }
             ⟨sc, s.pendingOffset⟩
-          let (ok, acc) := deliverEvents collect sink evs evs1
+          let (ok, acc) := deliverEvents collect ByteArray.empty sink evs evs1
           if ok && isActive s1 then finishGrammar s1 acc else (s1, acc)
         | .error e =>
           (failHere s e.reason.code e.reason.name (s.pendingOffset + e.offset), evs)
@@ -1676,10 +3059,23 @@ private def finishDecoded (collect : Bool) (sink : LocatedEvent → Bool)
     | .ascii => finishGrammar s evs
   | _ => finishGrammar s evs
 
-private def finishCore (collect : Bool) (sink : LocatedEvent → Bool)
+private def finishCore (collect : Bool) (sink : ByteArray → LocatedEvent → Bool)
     (s : Stream) : Stream × Array LocatedEvent :=
   match s.status with
   | .active =>
+    if !s.tagCarry.isEmpty then
+      -- A start tag that never completed: settle its bytes through the
+      -- per-byte machine, then finish from there so the EOF fault is the one
+      -- those bytes determine.
+      let base := s.rawConsumed
+      let carried := s.tagCarry
+      let settled := { s with
+        tagCarry := ByteArray.empty, tagCarryCopied := 0,
+        rawConsumed := s.rawConsumed + carried.size }
+      let (st1, evs1, ok1) := feedDecoded collect sink settled #[] carried base
+      if !ok1 then (noteFailure st1, evs1)
+      else noteFailure2 (finishDecoded collect sink st1 evs1)
+    else
     match s.enc with
     | .probing buf =>
       match chooseEncoding buf s.limits.maxTokenChars with
@@ -1707,10 +3103,10 @@ private def finishCore (collect : Bool) (sink : LocatedEvent → Bool)
 /-- Finish the document. A pending decoder fault is resolved before EOF-only
 grammar faults. A completed or failed stream is inert. -/
 def finishLocated (s : Stream) : Stream × Array LocatedEvent :=
-  finishCore true (fun _ => true) s
+  finishCore true (fun _ _ => true) s
 
 /-- Finish the document, offering each determined event to `sink`. -/
-def finishSink (sink : LocatedEvent → Bool) (s : Stream) : Stream :=
+def finishSink (sink : ByteArray → LocatedEvent → Bool) (s : Stream) : Stream :=
   (finishCore false sink s).1
 
 /-- Finish the document and return the events it determined. -/

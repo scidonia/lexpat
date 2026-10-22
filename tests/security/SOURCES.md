@@ -32,8 +32,8 @@ is.
 - Source class: NVD entry `https://nvd.nist.gov/vuln/detail/CVE-2021-45960`.
 - No PoC is imported.
 - Disposition: an original distinct-attribute generator within the raw-input and
-  event-frame bounds; the callback's ordered pairs are checked exactly. Cost is
-  measured; attribute count has no separate public budget.
+  callback-payload bounds; the callback's ordered pairs are checked exactly.
+  Cost is measured; attribute count has no separate public budget.
 
 ## CVE-2024-8176 — long linear internal-entity chain
 

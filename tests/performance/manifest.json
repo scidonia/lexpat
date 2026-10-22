@@ -1,0 +1,167 @@
+{
+  "cases": [
+    {
+      "bytes": 792,
+      "counts": {
+        "attr_pairs": 40,
+        "cdata_end": 0,
+        "cdata_start": 0,
+        "comment": 0,
+        "end": 21,
+        "pi": 0,
+        "start": 21,
+        "text_bytes": 150,
+        "xml_decl": 1
+      },
+      "event_digest": "e44016da694345e878290f1d0efbf33c584f2fef72447d2084f65ed22346be2a",
+      "file": "small.xml",
+      "id": "small",
+      "sha256": "8e7959d9065d77471df9b4330d5586b6ec432fda370578a3aca6a42fbb188d3d",
+      "success": true,
+      "text_digest": "15f1824544a441c5aa6398d9bc7f1d52a5a28eb0060487d6988b12db9b4bebaa"
+    },
+    {
+      "bytes": 524295,
+      "counts": {
+        "attr_pairs": 0,
+        "cdata_end": 0,
+        "cdata_start": 0,
+        "comment": 0,
+        "end": 1,
+        "pi": 0,
+        "start": 1,
+        "text_bytes": 524288,
+        "xml_decl": 0
+      },
+      "event_digest": "fa0816ca11c2af9a6bf897cbbeb612b17df26789862a2f608e87ed02ba01a15e",
+      "file": "text-512k.xml",
+      "id": "text-512k",
+      "sha256": "c428be3c1f470d9dbd4c8d4a151d13da1838bef79695c4685fd914f22917c998",
+      "success": true,
+      "text_digest": "ec8bb338811bbf800a8b5e507d06e08a1d9d05bde74294f6f7388f3bbfba82e5"
+    },
+    {
+      "bytes": 140007,
+      "counts": {
+        "attr_pairs": 10000,
+        "cdata_end": 0,
+        "cdata_start": 0,
+        "comment": 0,
+        "end": 10001,
+        "pi": 0,
+        "start": 10001,
+        "text_bytes": 10000,
+        "xml_decl": 0
+      },
+      "event_digest": "537a207d6a5292b27fc8e8ec37cfd5b44f8648ef7aa7fce1ec0f7d56c7ed39c7",
+      "file": "elements-10k.xml",
+      "id": "elements-10k",
+      "sha256": "c1c47a276b31c41cda15dd4d24b19deb241f67c96a5f945fb49090c6dd7627de",
+      "success": true,
+      "text_digest": "e4ee97ec252749d2096447e849628d0d7734f51700416eefbb33574bf0b3ee75"
+    },
+    {
+      "bytes": 8894,
+      "counts": {
+        "attr_pairs": 1000,
+        "cdata_end": 0,
+        "cdata_start": 0,
+        "comment": 0,
+        "end": 1,
+        "pi": 0,
+        "start": 1,
+        "text_bytes": 0,
+        "xml_decl": 0
+      },
+      "event_digest": "6fa9a4e1801fa1bf3b441fb4cc9d212eec9650410722180c68b303585feb2c1f",
+      "file": "attrs-1000.xml",
+      "id": "attrs-1000",
+      "sha256": "aa3e92d333f6b425cb9244a4dcd517ccd8988adf50f6dcaed11b6a403c1f3aec",
+      "success": true,
+      "text_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "bytes": 1792,
+      "counts": {
+        "attr_pairs": 0,
+        "cdata_end": 0,
+        "cdata_start": 0,
+        "comment": 0,
+        "end": 256,
+        "pi": 0,
+        "start": 256,
+        "text_bytes": 0,
+        "xml_decl": 0
+      },
+      "event_digest": "ba0d7a25e561be58c2b8de226c7bd47811de2483283faf59de6f2712617866ef",
+      "file": "depth-256.xml",
+      "id": "depth-256",
+      "sha256": "e244d8ecf9510b1c535818a10b57b589b6a65ad23225d07daa643a549587b3f8",
+      "success": true,
+      "text_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "bytes": 140007,
+      "counts": {
+        "attr_pairs": 0,
+        "cdata_end": 4000,
+        "cdata_start": 4000,
+        "comment": 4000,
+        "end": 1,
+        "pi": 4000,
+        "start": 1,
+        "text_bytes": 12000,
+        "xml_decl": 0
+      },
+      "event_digest": "e2802cfeb8459c7fe5592bbe0963129c29d4c5a82ae52d7bbcdcc9ef8a61e60e",
+      "file": "mixed.xml",
+      "id": "mixed",
+      "sha256": "646b1041f5778e2ba42d71aea53620a39d275fe2b1b82ec712a708dcc97b98c6",
+      "success": true,
+      "text_digest": "7e5fcf62df2175e3c28c598158ba52754d128195f5c0468db812bc76350f2c09"
+    },
+    {
+      "bytes": 60094,
+      "counts": {
+        "attr_pairs": 0,
+        "cdata_end": 0,
+        "cdata_start": 0,
+        "comment": 0,
+        "end": 1,
+        "pi": 0,
+        "start": 1,
+        "text_bytes": 30000,
+        "xml_decl": 1
+      },
+      "event_digest": "b46c1b658ea396ae6df017185465f1b3a494649cbc98f87772e355f15b364053",
+      "file": "utf16le.xml",
+      "id": "utf16le",
+      "sha256": "f5bb377c13d36c25687364f68f75f96c3424194af1325a3ca40ef656945f9e62",
+      "success": true,
+      "text_digest": "8a6d5f7b1061fefacb7509d5bf23a3227c8a3a6ecfe51dc9f666772c99b75b98"
+    },
+    {
+      "bytes": 60050,
+      "counts": {
+        "attr_pairs": 0,
+        "cdata_end": 0,
+        "cdata_start": 0,
+        "comment": 0,
+        "end": 1,
+        "pi": 0,
+        "start": 1,
+        "text_bytes": 120000,
+        "xml_decl": 1
+      },
+      "event_digest": "ca60c65f72d62accef24d7f808e332f20d09d3fcb28129d45a9442e216751256",
+      "file": "latin1.xml",
+      "id": "latin1",
+      "sha256": "7c758f8973d1587b6e934f72dca6d2b220dc960cf61538d50867576c660ca2c6",
+      "success": true,
+      "text_digest": "75148dcfc2180774862f4849f7c56fa10a38eb216690bfb7c038ab05667c5f22"
+    }
+  ],
+  "coalescing": "consecutive character-data callbacks with no intervening event are concatenated into one text record",
+  "oracle_side": "expat",
+  "version": 1
+}

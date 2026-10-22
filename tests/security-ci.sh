@@ -2,15 +2,26 @@
 # The bounded security step: CVE checks, fixed differential replay, injected
 # shim OOM, benchmark smoke and the four-target libFuzzer smoke.
 #
-#   tests/security-ci.sh --out <absolute-directory>
+#   tests/security-ci.sh --out <absolute-directory> [--build-dir <absolute-directory>]
 #
-# The caller applies the hard wall cap around this whole command (including
-# `nix develop` startup). Every stage writes its log under --out; the script
-# stops at the first failure.
+# With `--build-dir`, the prepared build is verified against its own content
+# manifests before any runtime check: a missing, stale or mismatched build is
+# refused rather than used. The same check runs again after the C ABI artifact
+# build, because `lake build` can relink the shipped artifact or regenerate Lean
+# C after the entry check. Without `--build-dir`, the script builds the fuzz
+# targets under `--out`, verifies that fresh build, and then runs the checks.
+#
+# Every stage announces its start, prints its elapsed time and keeps its own log
+# under <out>/stages. On failure the script names the failed stage and its log,
+# so a wall-clock cap cannot erase which stage was running. The caller applies
+# the hard wall cap around this whole command (including `nix develop`).
 set -euo pipefail
 
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 out=""
+build_dir=""
+last_stage=""
+stage_log=""
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -20,6 +31,14 @@ while [ "$#" -gt 0 ]; do
         exit 2
       fi
       out="$2"
+      shift 2
+      ;;
+    --build-dir)
+      if [ "$#" -lt 2 ]; then
+        echo "security-ci: --build-dir needs a directory" >&2
+        exit 2
+      fi
+      build_dir="$2"
       shift 2
       ;;
     *)
@@ -33,47 +52,98 @@ if [ -z "$out" ]; then
   echo "security-ci: --out is required" >&2
   exit 2
 fi
-case "$out" in
-  /*) ;;
-  *)
-    echo "security-ci: --out must be an absolute path" >&2
-    exit 2
-    ;;
-esac
-mkdir -p "$out"
+for path_name in out build_dir; do
+  value="${!path_name}"
+  if [ -n "$value" ]; then
+    case "$value" in
+      /*) ;;
+      *)
+        echo "security-ci: --$path_name must be an absolute path" >&2
+        exit 2
+        ;;
+    esac
+  fi
+done
+mkdir -p "$out/stages"
 
-echo "security-ci: corpus identity against 46980d2"
-git -C "$repo" diff --exit-code 46980d2 -- tests/corpus
-if [ -n "$(git -C "$repo" status --short -- tests/corpus)" ]; then
-  echo "security-ci: tests/corpus has untracked or staged changes" >&2
-  git -C "$repo" status --short -- tests/corpus >&2
-  exit 1
+stage_log_for() {
+  printf '%s/stages/%s.log' "$out" "$1"
+}
+
+stage() {
+  local name="$1"
+  shift
+  last_stage="$name"
+  stage_log="$(stage_log_for "$name")"
+  local started=$SECONDS
+  echo "security-ci: stage $name: start"
+  local rc=0
+  "$@" 2>&1 | tee "$stage_log" || rc=$?
+  local elapsed=$((SECONDS - started))
+  if [ "$rc" -ne 0 ]; then
+    echo "security-ci: stage $name: FAILED exit=$rc elapsed=${elapsed}s log=$stage_log" >&2
+    return "$rc"
+  fi
+  echo "security-ci: stage $name: end elapsed=${elapsed}s log=$stage_log"
+}
+
+on_exit() {
+  local code=$?
+  if [ "$code" -ne 0 ] && [ -n "$last_stage" ]; then
+    echo "security-ci: FAILED at stage $last_stage (exit $code); log ${stage_log:-unknown}" >&2
+  fi
+}
+trap on_exit EXIT
+
+if [ -n "$build_dir" ]; then
+  [ -d "$build_dir" ] || {
+    echo "security-ci: no prepared build at $build_dir" >&2
+    exit 1
+  }
+  stage verify-prepared-build python3 "$repo/scripts/security-fuzz-verify.py" \
+    --build-dir "$build_dir"
 fi
 
-echo "security-ci: C ABI artifact"
-(cd "$repo" && lake build lexpatCAbi)
+corpus_identity() {
+  echo "security-ci: corpus identity against 46980d2"
+  git -C "$repo" diff --exit-code 46980d2 -- tests/corpus
+  if [ -n "$(git -C "$repo" status --short -- tests/corpus)" ]; then
+    echo "security-ci: tests/corpus has untracked or staged changes" >&2
+    git -C "$repo" status --short -- tests/corpus >&2
+    return 1
+  fi
+}
 
-echo "security-ci: fuzz build"
-bash "$repo/scripts/security-fuzz-build.sh" --out "$out/fuzz-build" \
-  2>&1 | tee "$out/fuzz-build.log"
+cabi_artifact() {
+  (cd "$repo" && lake build lexpatCAbi)
+}
 
-echo "security-ci: CVE-class corpus"
-python3 "$repo/tests/security-cve.py" --no-build 2>&1 | tee "$out/cve.log"
+stage corpus-identity corpus_identity
+stage cabi-artifact cabi_artifact
 
-echo "security-ci: fixed differential exceptions"
-bash "$repo/tests/security-differential-fixed.sh" --out "$out/diff-fixed" \
-  2>&1 | tee "$out/diff-fixed.log"
+# `lake build` above can relink the shipped artifact or regenerate Lean C that
+# the prepared manifest covers. Re-check before any target or parser runs; a
+# build that no longer matches its manifest stops here, before CVE or fuzz.
+if [ -n "$build_dir" ]; then
+  stage verify-prepared-build-after-artifact \
+    python3 "$repo/scripts/security-fuzz-verify.py" --build-dir "$build_dir"
+fi
 
-echo "security-ci: injected shim allocation failures"
-bash "$repo/tests/security-oom-sanitized.sh" --out "$out/oom-sanitized" \
-  2>&1 | tee "$out/oom-sanitized.log"
+if [ -z "$build_dir" ]; then
+  stage fuzz-build bash "$repo/scripts/security-fuzz-build.sh" --out "$out/fuzz-build"
+  build_dir="$out/fuzz-build"
+  stage verify-fresh-build python3 "$repo/scripts/security-fuzz-verify.py" \
+    --build-dir "$build_dir"
+fi
 
-echo "security-ci: scaling benchmark smoke"
-bash "$repo/tests/security-benchmark.sh" --suite ci --out "$out/benchmark-ci" \
-  2>&1 | tee "$out/benchmark-ci.log"
+stage cve python3 "$repo/tests/security-cve.py" --no-build
+stage fixed-differential bash "$repo/tests/security-differential-fixed.sh" \
+  --out "$out/diff-fixed"
+stage oom-sanitized bash "$repo/tests/security-oom-sanitized.sh" \
+  --out "$out/oom-sanitized"
+stage benchmark-ci bash "$repo/tests/security-benchmark.sh" --suite ci \
+  --out "$out/benchmark-ci"
+stage fuzz-smoke bash "$repo/tests/security-fuzz-smoke.sh" \
+  --out "$out/fuzz-smoke" --build-dir "$build_dir"
 
-echo "security-ci: bounded fuzz smoke"
-bash "$repo/tests/security-fuzz-smoke.sh" --out "$out/fuzz-smoke" \
-  --build-dir "$out/fuzz-build" 2>&1 | tee "$out/fuzz-smoke.log"
-
-echo "security-ci: PASS (logs in $out)"
+echo "security-ci: PASS (stage logs in $out/stages)"

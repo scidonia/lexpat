@@ -8,10 +8,6 @@ import LexPat.Types
 
 namespace LexPat
 
-/-- The scalar value at `pos`, if any. -/
-def natAt (chars : Array DecodedChar) (pos : Nat) : Option Nat :=
-  (chars[pos]?).map (fun c => c.value.n)
-
 /-- `lo ≤ n ∧ n ≤ hi`, as a decidable predicate over naturals. -/
 def between (n lo hi : Nat) : Bool := decide (lo ≤ n ∧ n ≤ hi)
 
@@ -47,76 +43,86 @@ an XML declaration. -/
 def isAsciiNameChar (n : Nat) : Bool :=
   isAsciiLetter n || isAsciiDigit n || n == 0x2E || n == 0x5F || n == 0x2D
 
-/-- The scalars in `[start, stop)` as a `String`. -/
-def charsToString (chars : Array DecodedChar) (start stop : Nat) : String :=
+/-- The value of the byte at `pos`, if any. -/
+private def byteAt (data : ByteArray) (pos : Nat) : Option Nat :=
+  (data[pos]?).map UInt8.toNat
+
+/-- The bytes `[start, stop)` as a `String`. Each byte stands for the scalar of
+the same value; in an ASCII-compatible declaration every one of them is in
+`[0x00, 0x7F]`, and a byte above that range is carried through unchanged so the
+label is compared exactly as the document spelled it. -/
+private def bytesToString (data : ByteArray) (start stop : Nat) : String :=
   Id.run do
-    let mut buf : Array Char := #[]
+    let mut out := ""
     let mut i := start
-    while i < stop ∧ i < chars.size do
-      match chars[i]? with
-      | some c => buf := buf.push c.value.toChar
+    while i < stop ∧ i < data.size do
+      match data[i]? with
+      | some b => out := out.push (Char.ofNat b.toNat)
       | none => pure ()
       i := i + 1
-    return String.ofList buf.toList
+    return out
 
 /-- Extract the `encoding` pseudo-attribute of an XML declaration, permissively.
 
-This scanner runs over the raw declaration bytes decoded one byte per scalar
-(which is what an ASCII-compatible declaration is), and is used only to choose
-the decoder for the rest of the document. It never decides well-formedness: the
-document parser re-parses the declaration under the XML declaration grammar and
-rejects whatever this scanner tolerated. Returns `none` when the document does
-not start with `<?xml` followed by whitespace, or when the declaration is not
-parseable enough to find the attribute. -/
-def scanDeclEncodingLabel (chars : Array DecodedChar) : Option String :=
+This scanner runs over the raw declaration bytes, at byte indices, because an
+ASCII-compatible declaration is exactly the case where one byte is one scalar.
+It is used only to choose the decoder for the rest of the document; it never
+decides well-formedness, which the document parser re-checks under the XML
+declaration grammar, rejecting whatever this scanner tolerated. Returns `none`
+when the document does not start with `<?xml` followed by whitespace, or when
+the declaration is not parseable enough to find the attribute.
+
+`stop` bounds the scan: bytes at or past it are not read. -/
+def scanDeclEncodingLabel (data : ByteArray) (stop : Nat) : Option String :=
   Id.run do
-    if chars.size < 6 then return none
-    if natAt chars 0 != some 0x3C || natAt chars 1 != some 0x3F ||
-        natAt chars 2 != some 0x78 || natAt chars 3 != some 0x6D ||
-        natAt chars 4 != some 0x6C then
+    let end' := Nat.min data.size stop
+    if end' < 6 then return none
+    if byteAt data 0 != some 0x3C || byteAt data 1 != some 0x3F ||
+        byteAt data 2 != some 0x78 || byteAt data 3 != some 0x6D ||
+        byteAt data 4 != some 0x6C then
       return none
-    match natAt chars 5 with
+    match byteAt data 5 with
     | some n => if !isXmlWhitespace n then return none
     | none => return none
     let mut i := 5
     let mut label : Option String := none
     let mut done := false
-    while !done && decide (i < chars.size) do
-      while (match natAt chars i with
+    while !done && decide (i < end') do
+      while (match byteAt data i with
               | some n => isXmlWhitespace n
               | none => false) do
         i := i + 1
-      if decide (i + 1 < chars.size) && natAt chars i == some 0x3F &&
-          natAt chars (i + 1) == some 0x3E then
+      if decide (i + 1 < end') && byteAt data i == some 0x3F &&
+          byteAt data (i + 1) == some 0x3E then
         done := true
-      else if isAsciiLetter ((natAt chars i).getD 0) then
+      else if isAsciiLetter ((byteAt data i).getD 0) then
         let nameStart := i
-        while (match natAt chars i with
+        while (match byteAt data i with
                 | some n => isAsciiNameChar n
                 | none => false) do
           i := i + 1
-        let name := charsToString chars nameStart i
-        while (match natAt chars i with
+        let name := bytesToString data nameStart i
+        while (match byteAt data i with
                 | some n => isXmlWhitespace n
                 | none => false) do
           i := i + 1
-        if natAt chars i == some 0x3D then
+        if byteAt data i == some 0x3D then
           i := i + 1
-          while (match natAt chars i with
+          while (match byteAt data i with
                   | some n => isXmlWhitespace n
                   | none => false) do
             i := i + 1
-          if i < chars.size then
-            match natAt chars i with
+          if i < end' then
+            match byteAt data i with
             | some q =>
               if q == 0x22 || q == 0x27 then
                 i := i + 1
                 let valueStart := i
-                while i < chars.size ∧ natAt chars i ≠ some q do
+                while i < end' ∧ byteAt data i ≠ some q do
                   i := i + 1
-                if i < chars.size then
+                if i < end' then
                   if name == "encoding" then
-                    label := some (charsToString chars valueStart i)
+                    label := some (bytesToString data valueStart i)
                   i := i + 1
                 else
                   done := true

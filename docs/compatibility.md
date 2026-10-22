@@ -204,16 +204,48 @@ can be declared.
 ## C ABI call surface
 
 The repository builds `include/expat.h` and `liblexpat.so.1` from the streaming
-core. Events cross into C through an internal versioned record at the point the
-grammar determines them, so handlers run before the feeding `XML_Parse` or
-`XML_ParseBuffer` call returns; the pure `Stream.feed`/`Stream.finish` arrays and
-`parseDocument` are unchanged.
+core. Events reach handlers through private, callback-specific receiver
+functions at the point the grammar determines them, so handlers run before the
+feeding `XML_Parse` or `XML_ParseBuffer` call returns; the pure
+`Stream.feed`/`Stream.finish` arrays and `parseDocument` are unchanged. No event
+is serialized into an intermediate record and no Lean object is exposed to the
+client.
+
+Character data that is still one contiguous literal span of the chunk being fed
+is passed as a borrowed pointer plus an explicit byte length; the pointer is
+valid only for that callback. A start or end tag whose name and ordered
+attribute pairs are still ranges of that chunk is validated as ranges and copied
+once into per-callback NUL-terminated storage. Every XML declaration value,
+comment and processing-instruction string, and any tag whose name is not
+contiguous in the buffer, is copied from its owned payload into the same kind of
+NUL-terminated storage for the duration of its own callback. A receiver
+validates the source position, the span bounds, the ordered attribute table and
+the payload's UTF-8 legality before it allocates or calls a handler, so
+malformed internal metadata is refused before any callback runs. Positions are
+recorded even when no handler is installed.
 
 For x86_64-linux with the pinned Lean runtime, this header and shared object
 provide the subset below as the verified C integration route. It is not a
 drop-in replacement for libexpat: only the calls named here are exported, the
 private `XML_ParserStruct` layout is not Expat's, and the version and feature
 list identify lexpat (`lexpat_0.1.0-cabi1`, `{0, 1, 0}`), not Expat.
+
+The shared object carries `DF_1_NODELETE`, and that retention is deliberate:
+initializing the Lean runtime starts background threads whose entry points are
+inside the runtime library, and the runtime has no shutdown entry point that
+stops and joins them, so unmapping the object under those threads is undefined.
+`dlclose` therefore releases the handle without unmapping `liblexpat.so.1` or
+the runtime it depends on. There is no true unload: the image and the runtime's
+threads stay mapped, and the mapping is not reclaimed, until the process exits.
+A later `dlopen` of the same path reuses that image, and `dlclose` cannot be
+used to recover the memory or to reset the runtime.
+
+Repetition of that cycle is checked only over a finite lifetime:
+`tests/c-abi-verify.py --abi` runs 16 fresh processes, each performing one load,
+parse with an affirmative callback, free and close inside a 15-second child
+bound under one 60-second aggregate deadline, and reads the artifact's own
+`DT_FLAGS_1` `NODELETE` entry. A load/drop loop in one process, or an unbounded
+number of such processes, is not measured and is not claimed.
 
 ### Supported calls
 
@@ -311,11 +343,11 @@ against Expat's enum cannot read them as one of Expat's own codes:
 | --- | --- | --- |
 | `XML_ERROR_UNSUPPORTED_DTD` | 45 | any `DOCTYPE`, refused before its contents are read |
 | `XML_ERROR_LIMIT_INPUT` | 46 | raw input above the input budget |
-| `XML_ERROR_LIMIT_TOKEN` | 47 | one token accumulation above the token budget, or an event frame above its bound |
+| `XML_ERROR_LIMIT_TOKEN` | 47 | one token accumulation above the token budget, or one callback payload above its 16 MiB bound |
 | `XML_ERROR_LIMIT_DEPTH` | 48 | more open elements than the depth budget |
 | `XML_ERROR_LIMIT_ENTITY_EXPANSION` | 49 | cumulative reference output above the reference budget |
 | `XML_ERROR_UNSUPPORTED_FEATURE` | 50 | a declared unsupported call or handler |
-| `XML_ERROR_MALFORMED_WIRE` | 51 | a malformed internal event record |
+| `XML_ERROR_MALFORMED_WIRE` | 51 | malformed internal callback metadata: a span outside the owner or the fed bytes, an inverted span, an impossible position, an illegal attribute table or payload that is not valid UTF-8. The name is retained for a stable error surface |
 | `XML_ERROR_REENTRANT_CALL` | 52 | a parse call made from inside a callback |
 
 `XML_ErrorString` returns a stable static string for every code from 0 through

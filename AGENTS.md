@@ -12,6 +12,7 @@ nix develop -c lake build                      # library, proofs and the C ABI a
 nix develop -c lake build lexpatTrace          # the demonstration executable
 nix develop -c lake build lexpatEvents         # raw-event attribute-order driver
 nix develop -c lake env lean --run tests/OneShotPrecedence.lean
+nix develop -c lake env lean --run tests/ScannerDecoder.lean
 nix develop -c lake env lean --run tests/StreamingCases.lean
 nix develop -c lake exe lexpatTrace tests/corpus/basic.xml
 nix develop -c lake exe lexpatTrace --chunk-size 1 tests/corpus/basic.xml
@@ -21,7 +22,7 @@ nix develop -c bash tests/c-abi-contract.sh A2
 nix develop -c bash tests/c-abi-oom-contract.sh A3
 nix develop -c python3 tests/c-abi-differential.py
 nix develop -c python3 tests/c-abi-verify.py
-nix develop -c python3 tests/c-abi-verify.py --wire
+nix develop -c python3 tests/c-abi-verify.py --bridge
 nix develop -c bash tests/c-abi-memory.sh
 nix develop -c python3 tests/streaming.py
 nix develop -c python3 tests/differential.py
@@ -41,7 +42,8 @@ target. `lake build FuzzParser` type-checks the test-only raw parser entry
 point used by the fuzz target; it is not a default target and is not part of
 the library or the artifact. `.github/workflows/ci.yml` runs the library build,
 the clean build, the C ABI contracts A1, A2 and A3, one combined security step
-under a 300-second outer timeout, the C differential, the artifact
+under a 300-second process-group deadline held by
+`scripts/run-bounded-security.py`, the C differential, the artifact
 verification, the memory checks, the one-shot contract, the streaming checks,
 the full differential, the `limits` group, the admit check and the proof audit,
 in that order, after installing Nix with flakes enabled. The security step
@@ -154,6 +156,22 @@ pending decoder bytes are at most three, unfinished values are bounded by
 `maxTokenChars`, and no field retains a consumed chunk. Address space is not
 used as a proxy for resident bytes.
 
+The byte-index scanners are checked against the decoder itself in
+`tests/ScannerDecoder.lean`. Bulk markup is limited to the byte-oriented
+encodings and to a state with no unfinished decoded scalar: a byte that would
+complete or extend a partial scalar belongs to the per-byte machine, which
+reports that decoder's own reason and offset. The test pins `decodeUtf8One`'s
+accepted scalar and next offset and its rejection reason and offset for every
+UTF-8 length and fault class, including a nonzero start index, then requires the
+shipped scanner to agree on text, element-name, attribute-name and
+attribute-value bytes: the same payload when the bytes decode, and the same
+public code, reason and absolute offset when they do not. The declaration label
+scan is compared with the label the declaration grammar records for the same
+bytes, and its `stop` bound is asserted one byte either side of the value's
+closing quote. This is the check that a fast path may not outrun the decoder; a
+scanner that consumes a byte the decoder still owns fails here rather than in
+the differential.
+
 ## C ABI boundary
 
 `include/expat.h` over `liblexpat.so.1` is the bounded C surface;
@@ -162,6 +180,18 @@ error mapping, the buffer rules and the callback positions. The C route is
 verified only for that subset and only on x86_64-linux with the pinned Lean
 runtime; byte-identical output, Expat's private struct layout and symbols the
 header does not declare are not claimed.
+
+The shared object is linked with `-Wl,-z,nodelete`. Module initialization starts
+Lean runtime threads whose entry points live in the runtime library, and the
+runtime has no shutdown that stops and joins them, so `dlclose` releases the
+handle without unmapping either object. A check may repeat a load, parse, free
+and close sequence, but it must not assume the mapping goes away, and unloading
+is not a supported operation. That repetition is checked only over the finite
+lifetime `tests/c-abi-verify.py --abi` exercises: one cycle in each of 16 fresh
+processes, each inside a 15-second bound under one 60-second aggregate deadline,
+together with the artifact's own `NODELETE` flag. A load/drop loop in one
+process, or an unbounded number of processes, is not measured and is not
+claimed.
 
 `tests/c-abi-contract.sh` runs the C-boundary scenarios in
 `tests/c-abi-contract.md` against the shipped header and shared object, one
@@ -209,12 +239,32 @@ struct layout and callback typedef signature equality with the pinned header
 (with mutation controls), truthful version, version info and feature list,
 lifecycle and registry-checked released handles, buffer reservations and
 refusals, exact error codes and stable strings, callback positions, every
-declared unsupported family, malformed event frames and NULL/invalid-length,
-re-entrant and free-in-callback behavior. The malformed-frame group links the C
-shim and the Lean module objects into a test executable and injects fabricated
-version-1 frames through the same receiver the Lean producer calls; it is a test
-target, not an exported bypass. Nothing tests a fabricated non-NULL address or
-calls `XML_GetUserData` after a free.
+declared unsupported family, malformed internal callback metadata and
+NULL/invalid-length, re-entrant and free-in-callback behavior. The direct-bridge
+group (`--bridge`) links the C shim and the Lean module objects into a test
+executable and calls the callback-specific receivers the Lean producer calls,
+with fabricated Lean payload objects: the affirmative controls show a borrowed
+text span, a start tag with an ordered attribute pair, an end tag, a comment, a
+processing instruction, CDATA and a declaration reaching their handlers; the
+refusal controls show an inverted span, a span past its owner, an absolute
+boundary past the bytes fed, an impossible line or column, an overflowing base,
+an over-ceiling payload, illegal UTF-8 in each payload kind, an embedded NUL, an
+impossible declaration value, and a receiver with no current parser, each
+refused before any callback; an armed allocation failure reports
+`XML_ERROR_NO_MEMORY`; and a parse whose events have no handlers records zero
+payload allocations while the same events with handlers record a positive count.
+It is a test target, not an exported bypass. Nothing tests a fabricated
+non-NULL address or calls `XML_GetUserData` after a free.
+
+The shim has two kinds of receiver for a start or end tag: one takes owned
+parser payloads, the other takes byte ranges of the fed chunk plus that chunk's
+absolute base, which it validates against the owner, the bytes fed so far and the
+UTF-8 rules before copying the event into one arena. Which one a tag uses depends
+on the parser's state, so both are on the shipped path; `tests/c-abi-differential.py`
+compares the resulting names, ordered attributes and positions with the pinned
+oracle across whole, single-byte, fixed and seeded partitions. The direct-bridge
+group's fabricated controls cover the owned-payload receivers; a fabricated range
+or count for the range receiver is not yet exercised there.
 
 `tests/c-abi-memory.sh` runs the same client cases under an ASan/UBSan-instrumented
 shim and client, then runs the unsanitized client against the shipped shared
@@ -232,8 +282,23 @@ memory safety for every input, and neither is evidence about resident memory.
 `docs/security.md` is the published threat model: supported route, budgets, the
 CVE-class table, allocation-failure behavior, pointer lifetime and the limits of
 the evidence. The C ABI remains the only supported integration route. The
-combined bounded step is
-`timeout --signal=TERM --kill-after=5s 300s nix develop -c bash tests/security-ci.sh --out <absolute-directory>`.
+combined bounded step is run by `scripts/run-bounded-security.py`, which is
+invoked outside `nix develop` so its deadline includes Nix startup and every
+child the command starts:
+
+```sh
+OUT="$(mktemp -d "${TMPDIR:-/tmp}/lexpat-security.XXXXXX")"
+python3 scripts/run-bounded-security.py --seconds 300 --grace 5 \
+  --log "$OUT/bounded.log" \
+  -- nix develop -c bash tests/security-ci.sh --out "$OUT/stages"
+```
+
+A timeout exits 124 after terminating and reaping the whole process group; a
+child that exits but leaves a descendant behind exits 125 after the same
+cleanup; a failed sink or retained log exits 126 instead of reporting the
+child's status. The log names the last `security-ci:` stage that started and is
+kept on every outcome. The hosted job adds `--build-dir` for a prepared fuzz
+build, which the step verifies before any target or parser runs.
 
 The original 108-case `tests/corpus/` tree is unchanged. Security-specific
 inputs, provenance and expectations live under `tests/security/` and are driven
@@ -275,8 +340,8 @@ reaches the shim; the shipped `.so` is not intercepted, LD_PRELOAD is not used,
 and no Lean-runtime allocation is faulted. The wrapper's allocation/free ledger
 is the cleanup detector because LSan is off for the one-time Lean/libuv startup
 allocation. `tests/c-abi-oom-contract.sh A3` is the public-boundary scenario;
-`tests/c-abi-verify.py --wire` covers the internal frame bound and the shim
-allocation classification.
+`tests/c-abi-verify.py --bridge` covers the receiver's span, count, position and
+UTF-8 refusals plus the shim allocation classification.
 
 The fuzz build is reproducible from the locked inputs:
 `scripts/security-fuzz-build.sh --out <absolute-directory>` compiles the
@@ -310,6 +375,57 @@ forked child and the parent records that child's `wait4` resident peak, so
 load average in `flags`; a 1 KiB drift control before and after each family
 block fails the run above a 15% shift. Earlier full-suite readings from a
 different protocol are not evidence for the current one.
+
+## Performance benchmark
+
+`tests/performance-benchmark.sh` compares the candidate C ABI against a
+supplied base source tree and against the pinned libexpat, over the checked-in
+eight-case corpus in `tests/performance/corpus/`, the generator
+`tests/performance/generate.py` and the declared expectations in
+`tests/performance/manifest.json`.
+
+```sh
+BASE="$(mktemp -d "${TMPDIR:-/tmp}/lexpat-base.XXXXXX")"
+git archive 626761f | tar -x -C "$BASE"
+OUT="$(mktemp -d "${TMPDIR:-/tmp}/lexpat-perf.XXXXXX")"
+nix develop -c python3 tests/performance/generate.py --out "$OUT/generated"
+nix develop -c python3 tests/performance/compare.py --manifest tests/performance/manifest.json --check-corpus --generated "$OUT/generated" --shipped tests/performance/corpus
+nix develop -c bash tests/performance-benchmark.sh --candidate-source "$PWD" --out "$OUT/smoke" --phase smoke --samples 3 --warmups 1 --chunk 4096
+nix develop -c bash tests/performance-benchmark.sh --base-source "$BASE" --candidate-source "$PWD" --out "$OUT/text" --phase text --samples 9 --warmups 3 --chunk 4096 --enforce
+nix develop -c bash tests/performance-benchmark.sh --base-source "$BASE" --candidate-source "$PWD" --out "$OUT/full" --phase full --samples 9 --warmups 3 --chunk 4096 --enforce
+```
+
+`BASE` is a `git archive` snapshot of the base revision this comparison is
+against -- `626761f` for the readings recorded here -- and carries no build
+output: the script runs `lake build lexpatCAbi` in each source tree itself, in
+the dev shell the command runs in. `--candidate-source "$PWD"` is the working
+tree under test, so both inputs are ready before the first benchmark command.
+`--phase text` restricts the run to the literal-text case and `--phase full`
+runs all eight. `--base-source` and `--enforce` are required together outside
+the smoke phase, and every path must be absolute. The smoke phase runs the same
+corpus, handler and oracle preflight with a three-sample diagnostic and no
+speed threshold, so it can run on a shared runner.
+
+The preflight is independent of either parser: it checks each side against the
+manifest's declared outcome, handler families, payload bytes and ordered
+attributes before any timing is accepted, and a timed trial re-checks its
+declared counts. An incomplete parse, a wrong callback record or a zero median
+invalidates the run. Base and candidate never share a process: every reading
+loads exactly one library with `dlopen(..., RTLD_NOW | RTLD_LOCAL)` and calls it
+through its own `dlsym` table, and the base and candidate readings are separate
+processes. Timing covers `XML_Parse` and its callbacks with a fresh parser per
+repetition and excludes creation, free and fixture I/O; short cases use the same
+bounded repetition count on both sides, calibrated from the faster side.
+
+Every ratio row states its own unit and construction: `speedup` is a multiplier
+of paired same-session medians, `speedup = median base ns / median candidate
+ns`; `gap` is a multiplier, `gap = median candidate ns / median pinned expat
+ns`; `throughput` is MiB/s, literal body bytes over candidate parse seconds. A
+result is conditioned on the recorded session — artifact, oracle and toolchain
+hashes, CPU facts, affinity to one CPU and drift controls that make the session
+inconclusive above a 15% shift. Ratios are not universal constants, results are
+written only under an external `--out`, and a local reading is not hosted
+evidence.
 
 ## Corpus
 

@@ -198,12 +198,28 @@ inductive Event where
   | pi (target : String) (data : String)
 deriving Repr, DecidableEq, BEq
 
+/-- A byte span into the byte array that owns it. Constructor of the span is
+the caller's responsibility; every consumer validates `start ≤ stop ≤ size`. -/
+structure Span where
+  start : Nat
+  stop : Nat
+deriving Repr, DecidableEq
+
 /-- An `Event` together with the source coordinates recorded when the token was
 emitted. `byteOffset` is the raw byte index of the token's first byte,
 `tokenBytes` its raw byte span when the emitter knows it, `line` is 1-based,
 `column` is a 0-based scalar column, and `specifiedAttrs` is the number of
 explicit attribute pairs (nonzero only for a start event). The streaming core
-uses this for its optional event sink; the public `Event` array is unchanged. -/
+uses this for its optional event sink; the public `Event` array is unchanged.
+
+`textSpan` is set when the text payload is still a contiguous literal span of
+the chunk being fed: the event then carries an empty `text` payload and the
+sink may read the bytes in place while the chunk is alive. `textBytes` is set
+when the token's bytes had to be owned -- a token that crossed a feed boundary,
+a reference expansion or a normalized line ending -- and the sink may read them
+in place for the callback. At most one of the two is set. A consumer that needs
+an owned `String` -- the public `feed`/`finish` result -- materializes whichever
+it finds before use. -/
 structure LocatedEvent where
   event : Event
   byteOffset : Nat
@@ -211,6 +227,34 @@ structure LocatedEvent where
   line : Nat
   column : Nat
   specifiedAttrs : Nat
-deriving Repr
+  textSpan : Option Span := none
+  /-- The token's own UTF-8 bytes when no chunk span can name them. It is read
+  with an explicit length, so it needs no NUL terminator, and it stays owned by
+  the event until the event is released. -/
+  textBytes : Option ByteArray := none
+  /-- For a start event whose element name and ordered attribute pairs are still
+  spans of the buffer that was scanned: the name's byte range and, for each
+  attribute pair, four numbers (name start, name stop, value start, value stop),
+  all relative to that buffer. A consumer that needs owned text uses the `Event`
+  payload the emitter already built; a consumer that copies into its own arena
+  can read these ranges and copy once. -/
+  nameSpan : Option Span := none
+  attrRanges : Option (Array UInt64) := none
+  /-- The absolute offset of the first byte of the buffer `nameSpan` and
+  `attrRanges` are relative to. It differs from the feeding chunk's base when a
+  start tag was committed from bytes held over a feed boundary. Text spans always
+  refer to the chunk being fed. -/
+  sliceBase : Nat := 0
+
+/-- A text event's owned payload has no `Repr`, so it is reported by length. -/
+private def reprTextBytes : Option ByteArray → String
+  | none => "none"
+  | some bytes => s!"some ({bytes.size} bytes)"
+
+instance : Repr LocatedEvent where
+  reprPrec e prec :=
+    reprPrec (e.event, e.byteOffset, e.tokenBytes, e.line, e.column,
+              e.specifiedAttrs, e.textSpan, reprTextBytes e.textBytes, e.nameSpan,
+              e.attrRanges, e.sliceBase) prec
 
 end LexPat

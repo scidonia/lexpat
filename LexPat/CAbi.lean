@@ -1,138 +1,130 @@
 /-
 The C ABI bridge.
 
-This module is the Lean side of the `liblexpat.so.1` artifact. It
-turns each `LocatedEvent` the streaming core determines into one self-contained
-versioned byte frame and hands that frame to a receiver compiled into the same
-shared object. The receiver dispatches the parsed event to the C handlers the
-application registered; no Lean constructor tags, object shapes or globals are
-visible to the client.
+This module is the Lean side of the `liblexpat.so.1` artifact. Each determined
+event is delivered by calling one private, callback-specific receiver function
+compiled into the same shared object; nothing is serialized into a byte frame
+and no Lean constructor tag, object shape or global is visible to the client.
 
-The wire format (version 1) is:
+A text payload that is still one contiguous literal span of the chunk being fed
+is handed over as `(owner, start, stop)` together with the absolute offset of
+the chunk's first byte, so the receiver passes a borrowed pointer and an
+explicit length to the character data handler without materializing a `String`.
+The owner stays alive for the duration of the synchronous call. Every payload
+that the C contract requires as a NUL-terminated string -- an element, attribute,
+declaration, comment or processing-instruction name or value -- arrives as an
+owned `String`, and the receiver copies it into bounded storage that lives for
+that callback only.
 
-```
-"LXEV" | version:u8 | tag:u8 | reserved:u16 | length:u32
-       | byteOffset:u64 | line:u64 | column:u64 | tokenBytes:u32
-       | attributePairs:u32 | payload
-```
-
-All integers are little-endian and `length` includes the 44-byte header. Event
-tags are `0` XML declaration, `1` start, `2` end, `3` text, `4` CDATA start,
-`5` CDATA end, `6` comment, `7` processing instruction. Payload strings are a
-`u32` byte length followed by exact UTF-8 bytes; a declaration's optional
-encoding is a presence byte followed by its string, and its standalone value is
-a signed byte `-1`, `0` or `1`. Start payload is the element name followed by a
-`u32` pair count and the name/value strings in source order. A frame longer
-than 16 MiB is refused rather than truncated.
+The receiver validates the location, the span bounds and the ordered attribute
+table before it allocates or invokes a handler. A failed allocation is reported
+as `XML_ERROR_NO_MEMORY`; malformed metadata is reported through the stable
+`XML_ERROR_MALFORMED_WIRE` code before any callback runs.
 -/
 import LexPat.Stream
 
 namespace LexPat.CAbi
 
-/-- Hand one frame to the C receiver. Returns `0` to continue and nonzero when
-the receiver aborted the parse. -/
-@[extern "lexpat_cabi_emit_frame"]
-opaque emitFrame (frame : ByteArray) : UInt64
+@[extern "lexpat_cabi_emit_xml_decl"]
+opaque emitXmlDecl (version : String) (encoding : String) (hasEncoding : UInt8)
+  (standalone : Int64) (byteOffset line column : UInt64) : UInt64
 
-/-- Report that a serialized event exceeded the 16 MiB frame bound; the
-receiver poisons its parser with `XML_ERROR_LIMIT_TOKEN`. -/
-@[extern "lexpat_cabi_reject_frame"]
-opaque rejectFrame (size : UInt64) : UInt64
+@[extern "lexpat_cabi_emit_start"]
+opaque emitStart (name : String) (attrs : Array (String × String))
+  (byteOffset line column : UInt64) : UInt64
+
+/-- Deliver a start event whose element name and ordered attribute pairs are
+still spans of `owner`. `ranges` holds four owner-relative numbers per pair
+(name start, name stop, value start, value stop) and `base` is the absolute
+offset of `owner`'s first byte. The receiver validates every range and copies the
+whole event once. -/
+@[extern "lexpat_cabi_emit_start_slice"]
+opaque emitStartSlice (owner : ByteArray) (nameStart nameStop base : UInt64)
+  (ranges : Array UInt64) (byteOffset line column : UInt64) : UInt64
+
+@[extern "lexpat_cabi_emit_end"]
+opaque emitEnd (name : String) (byteOffset line column : UInt64) : UInt64
+
+/-- Deliver an end event whose name is still a span of `owner`. -/
+@[extern "lexpat_cabi_emit_end_slice"]
+opaque emitEndSlice (owner : ByteArray) (nameStart nameStop base : UInt64)
+  (byteOffset line column : UInt64) : UInt64
+
+/-- Deliver literal character data as a span of `owner`. `base` is the absolute
+byte offset of `owner`'s first byte, and the receiver requires
+`base + start` and `base + stop` to lie inside the bytes fed to this parser. -/
+@[extern "lexpat_cabi_emit_text"]
+opaque emitText (owner : ByteArray) (start stop base : UInt64)
+  (byteOffset line column : UInt64) : UInt64
+
+/-- Deliver character data that had to be materialized: a reference expansion, a
+normalized line ending or a token that crossed a feed boundary. -/
+@[extern "lexpat_cabi_emit_text_string"]
+opaque emitTextString (data : String) (byteOffset line column : UInt64) : UInt64
+
+/-- Deliver materialized character data as the byte array that holds it. The
+receiver reads it with an explicit length and validates it before the callback,
+so no `String` has to be built for a token that already arrived as bytes. -/
+@[extern "lexpat_cabi_emit_text_bytes"]
+opaque emitTextBytes (data : ByteArray) (byteOffset line column : UInt64) : UInt64
+
+@[extern "lexpat_cabi_emit_cdata_start"]
+opaque emitCdataStart (byteOffset line column : UInt64) : UInt64
+
+@[extern "lexpat_cabi_emit_cdata_end"]
+opaque emitCdataEnd (byteOffset line column : UInt64) : UInt64
+
+@[extern "lexpat_cabi_emit_comment"]
+opaque emitComment (data : String) (byteOffset line column : UInt64) : UInt64
+
+@[extern "lexpat_cabi_emit_pi"]
+opaque emitPi (target : String) (data : String) (byteOffset line column : UInt64) :
+  UInt64
 
 /-- Publish the stream's terminal status, error and cursor to the receiver.
 `code` is the event error index, or `255` when the stream has no error. -/
 @[extern "lexpat_cabi_report_status"]
 opaque reportStatus (status code offset line column rawConsumed : UInt64) : UInt64
 
-/-- The maximum frame, matching the C decoder's bound. -/
-def maxFrameBytes : Nat := 16 * 1024 * 1024
+private def standaloneValue : Option Bool → Int64
+  | none => -1
+  | some false => 0
+  | some true => 1
 
-private def pushU32 (out : ByteArray) (n : UInt32) : ByteArray :=
-  let v := n.toNat
-  out.push (UInt8.ofNat (v % 256))
-    |>.push (UInt8.ofNat ((v / 256) % 256))
-    |>.push (UInt8.ofNat ((v / 65536) % 256))
-    |>.push (UInt8.ofNat (v / 16777216 % 256))
-
-private def pushU64 (out : ByteArray) (n : UInt64) : ByteArray :=
-  let v := n.toNat
-  out.push (UInt8.ofNat (v % 256))
-    |>.push (UInt8.ofNat ((v / 256) % 256))
-    |>.push (UInt8.ofNat ((v / 65536) % 256))
-    |>.push (UInt8.ofNat ((v / 16777216) % 256))
-    |>.push (UInt8.ofNat ((v / 4294967296) % 256))
-    |>.push (UInt8.ofNat ((v / 1099511627776) % 256))
-    |>.push (UInt8.ofNat ((v / 281474976710656) % 256))
-    |>.push (UInt8.ofNat (v / 72057594037927936 % 256))
-
-private def pushString (out : ByteArray) (s : String) : ByteArray :=
-  let bytes := s.toUTF8
-  (pushU32 out (UInt32.ofNat bytes.size)).append bytes
-
-/-- The event tag of the wire format. -/
-def eventTag : Event → UInt8
-  | .xmlDecl .. => 0
-  | .start .. => 1
-  | .end .. => 2
-  | .text .. => 3
-  | .cdataStart => 4
-  | .cdataEnd => 5
-  | .comment .. => 6
-  | .pi .. => 7
-
-private def payload (event : Event) : ByteArray :=
-  match event with
-  | .xmlDecl version encoding standalone =>
-    let out := pushString ByteArray.empty version
-    let out :=
-      match encoding with
-      | none => out.push 0
-      | some name => (out.push 1).append (pushString ByteArray.empty name)
-    out.push (match standalone with
-      | none => 0xFF
-      | some false => 0
-      | some true => 1)
+/-- Offer one event to the receiver. `base` is the absolute offset of `owner`'s
+first byte; it is only read for a borrowed text span. -/
+private def emit (base : Nat) (owner : ByteArray) (e : LocatedEvent) : Bool :=
+  let off := UInt64.ofNat e.byteOffset
+  let line := UInt64.ofNat e.line
+  let col := UInt64.ofNat e.column
+  match e.event with
+  | .text data =>
+    match e.textSpan, e.textBytes with
+    | some sp, _ =>
+      emitText owner (UInt64.ofNat sp.start) (UInt64.ofNat sp.stop)
+        (UInt64.ofNat base) off line col == 0
+    | none, some bytes => emitTextBytes bytes off line col == 0
+    | none, none => emitTextString data off line col == 0
   | .start name attrs =>
-    let out := pushString ByteArray.empty name
-    let out := pushU32 out (UInt32.ofNat attrs.size)
-    attrs.foldl (init := out) fun acc (attrName, value) =>
-      pushString (pushString acc attrName) value
-  | .end name => pushString ByteArray.empty name
-  | .text data => pushString ByteArray.empty data
-  | .cdataStart => ByteArray.empty
-  | .cdataEnd => ByteArray.empty
-  | .comment data => pushString ByteArray.empty data
-  | .pi target data => pushString (pushString ByteArray.empty target) data
-
-/-- Serialize one located event as a version-1 frame. -/
-def encodeFrame (located : LocatedEvent) : ByteArray :=
-  let body := payload located.event
-  let total := 44 + body.size
-  let tokenBytes : UInt32 :=
-    match located.tokenBytes with
-    | some n => UInt32.ofNat n
-    | none => 0xFFFFFFFF
-  let header :=
-    ByteArray.empty.append "LXEV".toUTF8
-      |>.push 1
-      |>.push (eventTag located.event)
-      |>.push 0
-      |>.push 0
-      |>.append (pushU32 ByteArray.empty (UInt32.ofNat total))
-      |>.append (pushU64 ByteArray.empty (UInt64.ofNat located.byteOffset))
-      |>.append (pushU64 ByteArray.empty (UInt64.ofNat located.line))
-      |>.append (pushU64 ByteArray.empty (UInt64.ofNat located.column))
-      |>.append (pushU32 ByteArray.empty tokenBytes)
-      |>.append (pushU32 ByteArray.empty (UInt32.ofNat located.specifiedAttrs))
-  header.append body
-
-private def sink (located : LocatedEvent) : Bool :=
-  let frame := encodeFrame located
-  if frame.size > maxFrameBytes then
-    -- Consume the receiver's result so the call survives compilation even
-    -- though the sink's answer is already false.
-    rejectFrame (UInt64.ofNat frame.size) == 0xFFFFFFFFFFFFFFFF
-  else emitFrame frame == 0
+    match e.nameSpan, e.attrRanges with
+    | some sp, some ranges =>
+      emitStartSlice owner (UInt64.ofNat sp.start) (UInt64.ofNat sp.stop)
+        (UInt64.ofNat e.sliceBase) ranges off line col == 0
+    | _, _ => emitStart name attrs off line col == 0
+  | .end name =>
+    match e.nameSpan with
+    | some sp =>
+      emitEndSlice owner (UInt64.ofNat sp.start) (UInt64.ofNat sp.stop)
+        (UInt64.ofNat e.sliceBase) off line col == 0
+    | none => emitEnd name off line col == 0
+  | .comment data => emitComment data off line col == 0
+  | .pi target data => emitPi target data off line col == 0
+  | .cdataStart => emitCdataStart off line col == 0
+  | .cdataEnd => emitCdataEnd off line col == 0
+  | .xmlDecl version encoding standalone =>
+    match encoding with
+    | some enc => emitXmlDecl version enc 1 (standaloneValue standalone) off line col == 0
+    | none => emitXmlDecl version "" 0 (standaloneValue standalone) off line col == 0
 
 private def statusCode (s : Stream) : UInt64 :=
   match s.status with
@@ -195,14 +187,18 @@ def streamNew (_hint : UInt64) : Stream :=
   Stream.new
 
 /-- Feed one chunk. The stream and the chunk buffer are consumed and the
-continuation is returned owned by the caller. -/
+continuation is returned owned by the caller. Span indices name this chunk, so
+the base is the absolute offset of its first byte: everything before it is the
+stream's own consumed prefix plus any tag prefix it still holds unconsumed. -/
 @[export lexpat_cabi_stream_feed]
 def streamFeed (s : Stream) (bytes : ByteArray) : Stream :=
-  report (Stream.feedSink sink s bytes)
+  let base := s.rawConsumed + s.tagCarry.size
+  report (Stream.feedSink (emit base) s bytes)
 
-/-- Finish the document and return the terminal continuation. -/
+/-- Finish the document and return the terminal continuation. Every payload is
+materialized at this point: no chunk is being fed, so no span can be borrowed. -/
 @[export lexpat_cabi_stream_finish]
 def streamFinish (s : Stream) : Stream :=
-  report (Stream.finishSink sink s)
+  report (Stream.finishSink (fun _ e => emit 0 ByteArray.empty e) s)
 
 end LexPat.CAbi

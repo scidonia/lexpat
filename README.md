@@ -250,11 +250,12 @@ remain absent.
 
 A C-shim allocation failure during a callback now makes the same `XML_Parse`
 call return `XML_STATUS_ERROR` with `XML_GetErrorCode` equal to
-`XML_ERROR_NO_MEMORY` (1), not the generic malformed-wire code; a malformed
-internal frame still reports `XML_ERROR_MALFORMED_WIRE`. The public C scenario
-is `tests/c-abi-oom-contract.sh A3`, the direct-linked frame and allocation
-checks are `tests/c-abi-verify.py --wire`, and deterministic sanitizer-injected
-failures are `tests/security-oom-sanitized.sh`.
+`XML_ERROR_NO_MEMORY` (1); malformed internal callback metadata keeps the
+retained `XML_ERROR_MALFORMED_WIRE` (51) code and is refused before any handler
+runs. The public C scenario is `tests/c-abi-oom-contract.sh A3`, the
+direct-linked direct-receiver and allocation checks are
+`tests/c-abi-verify.py --bridge`, and deterministic sanitizer-injected failures
+are `tests/security-oom-sanitized.sh`.
 
 The security set uses the flake-locked Clang/LLVM 21.1.8, Lean 4.35.0 and the
 pinned libexpat 2.8.5 oracle. `OUT` below is an absolute directory outside the
@@ -267,9 +268,17 @@ nix develop -c bash tests/security-differential-fixed.sh --out "$OUT/diff"
 nix develop -c bash tests/security-oom-sanitized.sh --out "$OUT/oom"
 nix develop -c bash tests/security-benchmark.sh --suite ci --out "$OUT/bench"
 nix develop -c bash tests/security-fuzz-smoke.sh --out "$OUT/fuzz"
-timeout --signal=TERM --kill-after=5s 300s \
-  nix develop -c bash tests/security-ci.sh --out "$OUT/ci"
+python3 scripts/run-bounded-security.py --seconds 300 --grace 5 \
+  --log "$OUT/bounded.log" \
+  -- nix develop -c bash tests/security-ci.sh --out "$OUT/ci"
 ```
+
+The last command runs `tests/security-ci.sh` under
+`scripts/run-bounded-security.py`: one 300-second monotonic deadline enforced
+outside `nix develop`, so it covers Nix startup and every child the step starts.
+A timeout exits 124 after the whole process group is terminated and reaped, a
+child that leaves a descendant behind exits 125, a failed sink or retained log
+exits 126, and the combined output is kept in `$OUT/bounded.log`.
 
 `tests/security-fuzz-smoke.sh` runs the bounded parser, C ABI, shipped-artifact
 and in-process differential libFuzzer targets. The artifact target instruments
@@ -374,9 +383,18 @@ difference. `tests/c-abi-verify.py` checks source compatibility, the exact
 exported symbol set, SONAME/NEEDED/RUNPATH and a real loader launch, public layout and
 callback-signature equality with the pinned header, truthful version and feature
 identity, lifecycle, buffer, error, location,
-malformed-wire, fail-closed and NULL/invalid-length behavior.
+malformed-bridge-payload, fail-closed and NULL/invalid-length behavior.
 `tests/c-abi-memory.sh` runs an ASan/UBSan-instrumented shim and client and a
 Valgrind release client over those paths, and prints the detector limits.
+
+`tests/performance-benchmark.sh` is the throughput check: it parses the
+checked-in eight-fixture corpus under `tests/performance/` through the candidate
+C ABI, a supplied base source tree and the pinned libexpat, each library loaded
+in its own process, and reports per-document base/candidate speedup,
+candidate/libexpat gap and literal-text throughput. Every row states its unit
+and construction, and a run is conditioned on its recorded artifact and oracle
+hashes, CPU affinity and drift controls rather than published as a
+host-independent constant. Hosted CI runs only its threshold-free smoke phase.
 
 `tests/streaming.py` is the separate streaming check. It runs
 `tests/StreamingCases.lean` for direct API assertions, then every corpus case

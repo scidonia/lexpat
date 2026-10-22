@@ -18,9 +18,9 @@ not a drop-in replacement for libexpat. The Lean one-shot API,
 not production routes.
 
 Default limits are 8 MiB raw input, 1 MiB per token accumulation, 256 open
-elements, 1 MiB cumulative reference output and a 16 MiB internal event frame.
-The C ABI fixes these budgets; libexpat's configurable amplification and
-alloc-tracker controls are not implemented.
+elements, 1 MiB cumulative reference output and a 16 MiB per-callback payload
+ceiling. The C ABI fixes these budgets; libexpat's configurable amplification
+and alloc-tracker controls are not implemented.
 
 ## Structural properties
 
@@ -37,11 +37,19 @@ alloc-tracker controls are not implemented.
 - Element nesting uses an explicit stack, never recursion on input depth.
   Input, token, depth and reference budgets are enforced before the
   corresponding append or allocation.
-- The C ABI validates its internal event wire and the event-frame
-  attribute-pair count before allocating. Callback payloads have a bounded
-  lifetime, and parser handles are tracked so an immediate repeated free does
-  not dereference freed memory. A stale pointer whose address has been reused
-  is caller undefined behavior and is documented as such.
+- The C ABI's private receivers validate a span against its owning chunk and
+  the bytes fed so far, the source position, the ordered attribute table, the
+  payload ceiling and the payload's UTF-8 legality before allocating, so a
+  malformed internal call is refused before any handler runs. Callback payloads
+  have a bounded lifetime, and parser handles are tracked so an immediate
+  repeated free does not dereference freed memory. A stale pointer whose
+  address has been reused is caller undefined behavior and is documented as
+  such.
+  The serialized internal event record described by HS-7 and HS-9 below is
+  superseded: the artifact now calls callback-specific receivers directly, and
+  the bounds those findings added are enforced by the receivers before their
+  allocations. The findings remain as the record of what was fixed on that
+  path.
 
 ## Findings and fixes
 
@@ -113,7 +121,7 @@ differential exceptions are in [`docs/security.md`](security.md) and
 | Suspend/resume, parser-reset and reentrant-call bugs | APIs refused; nested parse is rejected; callback-time create is supported and bounded |
 | C parser integer/buffer/pointer arithmetic defects | Structurally removed in the Lean core; the C shim is separate and tested |
 | UTF-8/UTF-16 validation defects | Validated and covered by encoding-attack and differential cases |
-| Internal wire length/count defects | Metadata and pair counts bounded; focused malformed-frame tests |
+| Internal callback span/count defects | Span bounds, positions, ordered attribute tables, payload ceiling and UTF-8 bounded before allocation; focused direct-bridge tests |
 | Allocation-failure misclassification | Fixed and covered by A3 and the sanitized OOM matrix |
 | DoS/quadratic parsing | Token/depth/input budgets and scaling checks; residual risk remains for measured shapes and inputs |
 | Hash flooding | No attacker-keyed hash table in the parser; not applicable |
@@ -194,8 +202,11 @@ campaign corpus, crash file, binary or per-run log is committed.
   dereferences the handle directly.
 - Scaling and campaign thresholds apply to the measured shapes, sizes and host;
   they are not a complexity proof.
-- Hosted CI is currently failing in the bounded security step; the timeout and
-  stage output need repair before the hosted result can be called green.
+- The last hosted run, for commit `4999987`, failed in the bounded security
+  step and the hosted result is not green. The process-group wrapper, per-stage
+  logs, prepared-build identity checks and failure artifact that address it are
+  present in the working tree; no hosted run has validated them yet, so they are
+  not hosted evidence.
 - The C ABI remains a bounded subset, not a drop-in libexpat replacement.
 
 ## Change log
