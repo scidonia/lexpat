@@ -6,10 +6,15 @@ on:
   pull_request:
     branches: ["main"]
   workflow_dispatch:
+    inputs:
+      runner:
+        description: "Runner label (ubuntu-latest or a self-hosted label)"
+        required: false
+        default: "ubuntu-latest"
 
 jobs:
   checks:
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v4
         with:
