@@ -432,3 +432,10 @@ The executable printed at the top of a run is the libexpat build in the dev
 shell (recorded as `expat_2.8.5` for the current lock). Upstream libexpat
 `R_2_9_0` is the semantic reference for the subset and is not vendored or
 fetched by any check.
+
+## License
+
+Copyright 2026 Scidonia Limited.
+
+Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) and
+[NOTICE](NOTICE).

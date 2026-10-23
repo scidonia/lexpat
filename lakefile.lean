@@ -5,6 +5,8 @@ package lexpat where
   version := v!"0.1.0"
   description := "XML 1.0 parsing semantics in Lean 4, with a resumable streaming core and a bounded differential fixture against libexpat."
   keywords := #["xml", "parser", "security", "expat", "lean4"]
+  license := "Apache-2.0"
+  licenseFiles := #["LICENSE", "NOTICE"]
   /- The library needs this toolchain and no other. Saying so makes `lake update`
   prefer it for downstream packages rather than resolving them onto a toolchain the
   library cannot build on. -/
