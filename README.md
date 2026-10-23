@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/assets/lexpat.png" alt="lexpat" width="720">
+</p>
+
 # lexpat
 
 A Lean 4 port of libexpat's XML 1.0 parsing semantics, aimed at untrusted
